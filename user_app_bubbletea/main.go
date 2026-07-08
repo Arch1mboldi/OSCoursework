@@ -1,63 +1,56 @@
-// procmon — Linux 进程全量监控 TUI
+// procmon — Linux 进程全量监控 TUI (纯标准库, 零外部依赖)
 //
-// 基于 Bubble Tea 框架，通过自定义系统调用 (470/471/472) 获取数据。
-// 功能: 多条件过滤 · 实时刷新(1s) · 排序 · 进程树可视化
+// 通过自定义系统调用 (470/471/472) 获取数据。
+// 使用原始终端模式 + ANSI 转义序列实现 TUI。
 //
-// 编译 (在 VM 内):
+// 编译:
+//   go build -o procmon .
+//   sudo ./procmon
 //
-//	go mod tidy
-//	go build -o procmon .
-//	sudo ./procmon
-//
-// 依赖: github.com/charmbracelet/bubbletea, github.com/charmbracelet/lipgloss
+// 功能: 多条件过滤 · 实时刷新(1s) · 排序 · 进程树可视化 · 纯键盘操作
 
 package main
 
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"unsafe"
-
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // ============================================================================
 // Syscall 数据结构 — 必须与内核 include/linux/proc_monitor.h 字节级一致
 // ============================================================================
 
-// ProcInfo 对应内核 struct proc_info (sizeof=80, x86_64)
 type ProcInfo struct {
-	Pid        int32    // offset 0
-	Ppid       int32    // offset 4
-	Comm       [16]byte // offset 8
-	State      int32    // offset 24
-	_pad1      [4]byte  // offset 28 → align uint64
-	Utime      uint64   // offset 32
-	Stime      uint64   // offset 40
-	Vsize      uint64   // offset 48
-	Rss        uint64   // offset 56
-	Nice       int32    // offset 64
-	NumThreads int32    // offset 68
-	Uid        uint32   // offset 72
-	_pad2      [4]byte  // offset 76 → align struct
+	Pid        int32
+	Ppid       int32
+	Comm       [16]byte
+	State      int32
+	_pad1      [4]byte
+	Utime      uint64
+	Stime      uint64
+	Vsize      uint64
+	Rss        uint64
+	Nice       int32
+	NumThreads int32
+	Uid        uint32
+	_pad2      [4]byte
 }
 
-// ProcTreeNode 对应内核 struct proc_tree_node (sizeof=32)
 type ProcTreeNode struct {
-	Pid   int32    // offset 0
-	Ppid  int32    // offset 4
-	Comm  [16]byte // offset 8
-	Level int32    // offset 24
-	_pad  [4]byte  // offset 28
+	Pid   int32
+	Ppid  int32
+	Comm  [16]byte
+	Level int32
+	_pad  [4]byte
 }
 
-// ProcStat 对应内核 struct proc_stat (sizeof=40)
 type ProcStat struct {
 	Total           int32
 	Running         int32
@@ -80,10 +73,9 @@ const (
 	SYS_PROC_SNAPSHOT = 471
 	SYS_PROC_STAT     = 472
 	MAX_PROCS         = 8192
-	HZ                = 100 // Linux x86_64 标准时钟滴答频率
+	HZ                = 100
 )
 
-// cstr 将内核的定长 comm[16] 转为 Go string
 func cstr(b [16]byte) string {
 	n := 0
 	for n < 16 && b[n] != 0 {
@@ -92,7 +84,6 @@ func cstr(b [16]byte) string {
 	return string(b[:n])
 }
 
-// fetchProcs 调用 sys_proc_collect(470)，返回所有进程信息
 func fetchProcs() ([]ProcInfo, error) {
 	buf := make([]ProcInfo, MAX_PROCS)
 	var count int32
@@ -108,7 +99,6 @@ func fetchProcs() ([]ProcInfo, error) {
 	return buf[:count], nil
 }
 
-// fetchTree 调用 sys_proc_snapshot(471)，返回进程树拓扑
 func fetchTree() ([]ProcTreeNode, error) {
 	buf := make([]ProcTreeNode, MAX_PROCS)
 	var count int32
@@ -124,7 +114,6 @@ func fetchTree() ([]ProcTreeNode, error) {
 	return buf[:count], nil
 }
 
-// fetchStat 调用 sys_proc_stat(472)，返回进程统计摘要
 func fetchStat() (ProcStat, error) {
 	var stat ProcStat
 	_, _, errno := syscall.Syscall(
@@ -139,22 +128,19 @@ func fetchStat() (ProcStat, error) {
 }
 
 // ============================================================================
-// 进程树构建
+// 进程树
 // ============================================================================
 
-// TreeNode 用于内存中构建和渲染进程树
 type TreeNode struct {
 	Info     ProcTreeNode
 	Children []*TreeNode
 }
 
-// buildTree 从扁平 pid/ppid 列表构建树，以 PID=1 为根
 func buildTree(nodes []ProcTreeNode) *TreeNode {
 	nodeMap := make(map[int32]*TreeNode, len(nodes))
 	for _, n := range nodes {
 		nodeMap[n.Pid] = &TreeNode{Info: n}
 	}
-
 	var root *TreeNode
 	for _, n := range nodes {
 		node := nodeMap[n.Pid]
@@ -164,8 +150,6 @@ func buildTree(nodes []ProcTreeNode) *TreeNode {
 			root = node
 		}
 	}
-
-	// 回收孤儿节点，挂到 init 下
 	for _, n := range nodes {
 		if _, hasParent := nodeMap[n.Ppid]; !hasParent && n.Pid != 1 {
 			if initNode, ok := nodeMap[1]; ok {
@@ -173,8 +157,6 @@ func buildTree(nodes []ProcTreeNode) *TreeNode {
 			}
 		}
 	}
-
-	// 按 PID 排序子节点，保证输出稳定
 	if root != nil {
 		sortTree(root)
 	}
@@ -190,7 +172,6 @@ func sortTree(n *TreeNode) {
 	}
 }
 
-// renderLines 递归渲染进程树为字符串行列表
 func (n *TreeNode) renderLines() []string {
 	var lines []string
 	n.render(&lines, "", true)
@@ -204,7 +185,6 @@ func (n *TreeNode) render(lines *[]string, prefix string, isLast bool) {
 	}
 	*lines = append(*lines, fmt.Sprintf("%s%s%s(%d)",
 		prefix, connector, cstr(n.Info.Comm), n.Info.Pid))
-
 	childPrefix := prefix + "│   "
 	if isLast {
 		childPrefix = prefix + "    "
@@ -215,81 +195,296 @@ func (n *TreeNode) render(lines *[]string, prefix string, isLast bool) {
 }
 
 // ============================================================================
-// Bubble Tea 消息类型
+// ANSI 样式函数 (替代 lipgloss, 零依赖)
 // ============================================================================
-
-// TickMsg 每秒触发一次数据刷新
-type TickMsg time.Time
-
-// ============================================================================
-// 视图模式 & 排序字段
-// ============================================================================
-
-type ViewMode int
 
 const (
-	ViewList ViewMode = iota
-	ViewTree
-	ViewHelp
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiDim    = "\033[2m"
+	ansiRed    = "\033[31m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiBlue   = "\033[34m"
+	ansiCyan   = "\033[36m"
+	ansiWhite  = "\033[37m"
+	ansiGray   = "\033[90m"
+
+	bgBlue   = "\033[44m"
+	bgGray   = "\033[100m"
 )
 
-type SortField int
+type colorFn func(string) string
 
-const (
-	SortByPID SortField = iota
-	SortByCPU
-	SortByMem
-	SortByName
+func makeColor(open string) colorFn {
+	return func(s string) string { return open + s + ansiReset }
+}
+
+var (
+	titleFg   = makeColor(ansiBold + ansiWhite + bgBlue)
+	headerFg  = makeColor(ansiBold + ansiWhite + bgGray)
+	helpTitle = makeColor(ansiBold + ansiCyan)
+	treeLine  = makeColor(ansiCyan)
+	keyFg     = makeColor(ansiBold + ansiYellow)
+	filterFg  = makeColor(ansiYellow)
+	dimFg     = makeColor(ansiDim + ansiGray)
+	greenFg   = makeColor(ansiGreen)
+	warnFg    = makeColor(ansiYellow)
+	redFg     = makeColor(ansiRed)
 )
 
-func (s SortField) Label() string {
-	return [...]string{"PID", "CPU", "MEM", "NAME"}[s]
+func stateColor(state byte) colorFn {
+	switch state {
+	case 'R':
+		return greenFg
+	case 'Z':
+		return redFg
+	case 'D':
+		return warnFg
+	default:
+		return dimFg
+	}
 }
 
 // ============================================================================
-// Model
+// 终端原始模式
 // ============================================================================
 
+const (
+	ioctlTCGETS = 0x5401 // linux/amd64
+	ioctlTCSETS = 0x5402
+	ioctlGWINSZ = 0x5413
+
+	// termios flags
+	flagIGNBRK = 0000001
+	flagBRKINT = 0000002
+	flagPARMRK = 0000010
+	flagISTRIP = 0000040
+	flagINLCR  = 0000100
+	flagIGNCR  = 0000200
+	flagICRNL  = 0000400
+	flagIXON   = 0002000
+	flagOPOST  = 0000001
+	flagECHO   = 0000010
+	flagECHONL = 0000100
+	flagICANON = 0000002
+	flagISIG   = 0000001
+	flagIEXTEN = 0100000
+	flagCSIZE  = 0000060
+	flagPARENB = 0000400
+	flagCS8    = 0000060
+)
+
+type termios struct {
+	Iflag  uint32
+	Oflag  uint32
+	Cflag  uint32
+	Lflag  uint32
+	Line   uint8
+	Cc     [32]uint8
+	Ispeed uint32
+	Ospeed uint32
+}
+
+type winsize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
+
+func setRaw(fd uintptr) (*termios, error) {
+	var old termios
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
+		fd, ioctlTCGETS, uintptr(unsafe.Pointer(&old))); errno != 0 {
+		return nil, fmt.Errorf("TCGETS: %s", errno)
+	}
+	raw := old
+	raw.Iflag &^= flagIGNBRK | flagBRKINT | flagPARMRK | flagISTRIP |
+		flagINLCR | flagIGNCR | flagICRNL | flagIXON
+	raw.Oflag &^= flagOPOST
+	raw.Lflag &^= flagECHO | flagECHONL | flagICANON | flagISIG | flagIEXTEN
+	raw.Cflag &^= flagCSIZE | flagPARENB
+	raw.Cflag |= flagCS8
+	raw.Cc[syscall.VMIN] = 1
+	raw.Cc[syscall.VTIME] = 0
+
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
+		fd, ioctlTCSETS, uintptr(unsafe.Pointer(&raw))); errno != 0 {
+		return nil, fmt.Errorf("TCSETS: %s", errno)
+	}
+	return &old, nil
+}
+
+func restoreTerm(fd uintptr, old *termios) {
+	syscall.Syscall(syscall.SYS_IOCTL, fd, ioctlTCSETS, uintptr(unsafe.Pointer(old)))
+	fmt.Print("\033[?1049l") // exit alt screen
+	fmt.Print("\033[?25h")   // show cursor
+}
+
+func getTermSize() (int, int) {
+	var ws winsize
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
+		os.Stdout.Fd(), ioctlGWINSZ, uintptr(unsafe.Pointer(&ws)))
+	if errno != 0 {
+		return 80, 24
+	}
+	w := int(ws.Col)
+	h := int(ws.Row)
+	if w < 40 {
+		w = 40
+	}
+	if h < 10 {
+		h = 10
+	}
+	return w, h
+}
+
+// ============================================================================
+// 键盘输入解析
+// ============================================================================
+
+type keyEvent struct {
+	code rune
+	alt  bool
+}
+
+const (
+	keyUp     rune = 0x100 + iota
+	keyDown
+	keyRight
+	keyLeft
+	keyPgUp
+	keyPgDn
+	keyHome
+	keyEnd
+)
+
+func readStdin(ch chan<- keyEvent) {
+	buf := make([]byte, 64)
+	state := 0       // 0=normal, 1=saw ESC, 2=saw ESC[
+	var seq []byte
+
+	for {
+		n, err := os.Stdin.Read(buf)
+		if err != nil {
+			close(ch)
+			return
+		}
+		for i := 0; i < n; i++ {
+			b := buf[i]
+
+			switch state {
+			case 0: // normal
+				switch {
+				case b == 27: // ESC
+					state = 1
+					seq = []byte{b}
+				case b == 127 || b == 8: // backspace
+					ch <- keyEvent{code: 127}
+				case b == 13 || b == 10: // enter
+					ch <- keyEvent{code: 13}
+				case b == 9: // tab
+					ch <- keyEvent{code: 9}
+				case b == 3: // Ctrl+C
+					ch <- keyEvent{code: 3}
+				case b == 4: // Ctrl+D
+					ch <- keyEvent{code: keyPgDn}
+				case b == 21: // Ctrl+U
+					ch <- keyEvent{code: keyPgUp}
+				case b < 32:
+					// other control chars, ignore
+				default:
+					ch <- keyEvent{code: rune(b)}
+				}
+			case 1: // saw ESC
+				if b == '[' {
+					state = 2
+					seq = append(seq, b)
+				} else if b == 27 {
+					ch <- keyEvent{code: 27} // ESC key
+					seq = seq[:0]
+				} else {
+					// Alt+key
+					ch <- keyEvent{code: rune(b), alt: true}
+					state = 0
+				}
+			case 2: // saw ESC[ — gather CSI params
+				seq = append(seq, b)
+				if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~' {
+					state = 0
+					s := string(seq)
+					switch s {
+					case "[A":
+						ch <- keyEvent{code: keyUp}
+					case "[B":
+						ch <- keyEvent{code: keyDown}
+					case "[C":
+						ch <- keyEvent{code: keyRight}
+					case "[D":
+						ch <- keyEvent{code: keyLeft}
+					case "[H", "[1~":
+						ch <- keyEvent{code: keyHome}
+					case "[F", "[4~":
+						ch <- keyEvent{code: keyEnd}
+					case "[5~":
+						ch <- keyEvent{code: keyPgUp}
+					case "[6~":
+						ch <- keyEvent{code: keyPgDn}
+					}
+					seq = seq[:0]
+				}
+			}
+		}
+	}
+}
+
+// ============================================================================
+// Model & 事件循环
+// ============================================================================
+
+type viewMode int
+
+const (
+	viewList viewMode = iota
+	viewTree
+	viewHelp
+)
+
+type sortField int
+
+const (
+	sortByPID sortField = iota
+	sortByCPU
+	sortByMem
+	sortByName
+)
+
+func (s sortField) label() string {
+	return [...]string{"PID", "CPU", "MEM", "NAME"}[s]
+}
+
 type model struct {
-	// 数据
 	procs     []ProcInfo
 	treeNodes []ProcTreeNode
 	stat      ProcStat
 	treeRoot  *TreeNode
 
-	// 视图状态
-	mode      ViewMode
-	sortField SortField
+	mode      viewMode
+	sortF     sortField
 	sortDesc  bool
 
-	// 过滤
 	filterText string
-	filtering  bool // 正在编辑过滤条件
+	filtering  bool
 
-	// 滚动
 	scrollY int
+	width   int
+	height  int
 
-	// 终端尺寸
-	width  int
-	height int
-
-	// 状态
-	ready   bool
 	lastErr string
+	ready   bool
 	quit    bool
 }
-
-func initialModel() model {
-	return model{
-		mode:      ViewList,
-		sortField: SortByPID,
-		sortDesc:  false,
-	}
-}
-
-// ============================================================================
-// 数据获取
-// ============================================================================
 
 func (m *model) fetchAll() {
 	procs, err := fetchProcs()
@@ -314,17 +509,12 @@ func (m *model) fetchAll() {
 		return
 	}
 	m.stat = stat
-
 	m.lastErr = ""
 	m.ready = true
 }
 
-// ============================================================================
-// 排序
-// ============================================================================
-
 func (m *model) sortProcs() {
-	if m.sortField == SortByPID {
+	if m.sortF == sortByPID {
 		sort.Slice(m.procs, func(i, j int) bool {
 			if m.sortDesc {
 				return m.procs[i].Pid > m.procs[j].Pid
@@ -333,7 +523,7 @@ func (m *model) sortProcs() {
 		})
 		return
 	}
-	if m.sortField == SortByName {
+	if m.sortF == sortByName {
 		sort.Slice(m.procs, func(i, j int) bool {
 			ni, nj := cstr(m.procs[i].Comm), cstr(m.procs[j].Comm)
 			if m.sortDesc {
@@ -343,10 +533,8 @@ func (m *model) sortProcs() {
 		})
 		return
 	}
-
-	// CPU 或 MEM 排序（数值降序更直观 → 默认降序）
 	desc := m.sortDesc
-	if m.sortField == SortByCPU {
+	if m.sortF == sortByCPU {
 		sort.Slice(m.procs, func(i, j int) bool {
 			ci := m.procs[i].Utime + m.procs[i].Stime
 			cj := m.procs[j].Utime + m.procs[j].Stime
@@ -355,7 +543,7 @@ func (m *model) sortProcs() {
 			}
 			return ci < cj
 		})
-	} else { // SortByMem
+	} else {
 		sort.Slice(m.procs, func(i, j int) bool {
 			if desc {
 				return m.procs[i].Rss > m.procs[j].Rss
@@ -365,64 +553,40 @@ func (m *model) sortProcs() {
 	}
 }
 
-// ============================================================================
-// 过滤
-// ============================================================================
-
-// filteredProcs 返回符合当前过滤条件的进程列表
 func (m *model) filteredProcs() []ProcInfo {
 	if m.filterText == "" {
 		return m.procs
 	}
 	text := strings.ToLower(m.filterText)
-
 	var result []ProcInfo
 	for _, p := range m.procs {
-		if m.matchFilter(p, text) {
+		if matchFilter(p, text) {
 			result = append(result, p)
 		}
 	}
 	return result
 }
 
-// matchFilter 检查单个进程是否匹配过滤条件
-// 支持语法:
-//
-//	"systemd"     — 进程名子串匹配 (忽略大小写)
-//	"=R"          — 按状态过滤 (R/S/D/T/Z/I)
-//	":1234"       — 按 PID 精确匹配
-func (m *model) matchFilter(p ProcInfo, text string) bool {
+func matchFilter(p ProcInfo, text string) bool {
 	switch {
 	case strings.HasPrefix(text, "="):
-		// 状态过滤
-		stateChar := strings.ToUpper(strings.TrimPrefix(text, "="))
-		for _, r := range stateChar {
-			if len(r) == 0 {
-				continue
-			}
-			got := stateByte(p.State)
-			if got == byte(r) {
+		for _, r := range strings.TrimPrefix(text, "=") {
+			if stateByte(p.State) == byte(r) {
 				return true
 			}
 		}
 		return false
-
 	case strings.HasPrefix(text, ":"):
-		// PID 过滤
-		pidStr := strings.TrimPrefix(text, ":")
-		pid, err := strconv.Atoi(pidStr)
+		pid, err := strconv.Atoi(strings.TrimPrefix(text, ":"))
 		if err != nil {
 			return false
 		}
 		return int(p.Pid) == pid
-
 	default:
-		// 进程名子串匹配
 		return strings.Contains(strings.ToLower(cstr(p.Comm)), text)
 	}
 }
 
-// stateByte 将内核状态码转为可显示字符
 func stateByte(state int32) byte {
 	switch state {
 	case 0:
@@ -433,12 +597,8 @@ func stateByte(state int32) byte {
 		return 'D'
 	case 4:
 		return 'T'
-	case 8:
-		return 't' // traced
 	case 16:
 		return 'Z'
-	case 32:
-		return 'X'
 	case 1026:
 		return 'I'
 	default:
@@ -446,268 +606,117 @@ func stateByte(state int32) byte {
 	}
 }
 
-// cpuSec 计算进程 CPU 时间（秒）
 func cpuSec(p ProcInfo) float64 {
 	return float64(p.Utime+p.Stime) / HZ
 }
 
-// ============================================================================
-// Bubble Tea Init
-// ============================================================================
-
-// InitDataMsg 在程序启动时触发首次数据加载
-type InitDataMsg struct{}
-
-// Init 返回启动命令：进入 AltScreen + 首次数据加载
-func (m model) Init() tea.Cmd {
-	return tea.Batch(
-		tea.EnterAltScreen,
-		tea.SetWindowTitle("Process Monitor"),
-		func() tea.Msg { return InitDataMsg{} },
-	)
-}
-
-func tickCmd() tea.Cmd {
-	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
-		return TickMsg(t)
-	})
+func formatSize(bytes uint64) string {
+	switch {
+	case bytes >= 1<<30:
+		return fmt.Sprintf("%.1fG", float64(bytes)/(1<<30))
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1fM", float64(bytes)/(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.1fK", float64(bytes)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
 }
 
 // ============================================================================
-// Bubble Tea Update
+// 渲染
 // ============================================================================
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
+func (m *model) render() {
+	m.width, m.height = getTermSize()
 
-	case InitDataMsg:
-		m.fetchAll()
-		return m, tickCmd()
+	var buf strings.Builder
+	buf.WriteString("\033[H") // cursor to (0,0)
 
-	case TickMsg:
-		m.fetchAll()
-		return m, tickCmd()
+	// 1. Stats bar
+	m.writeStatsBar(&buf)
+	buf.WriteByte('\n')
 
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		return m, nil
+	// 2. Separator
+	m.writeHLine(&buf)
+	buf.WriteByte('\n')
 
-	case tea.KeyMsg:
-		return m.handleKey(msg)
-
-	case tea.QuitMsg:
-		m.quit = true
-		return m, tea.Quit
-	}
-
-	return m, nil
-}
-
-func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	key := msg.String()
-
-	// ── 过滤模式 ──
-	if m.filtering {
-		switch key {
-		case "enter":
-			m.filtering = false
-		case "esc":
-			m.filterText = ""
-			m.filtering = false
-		case "backspace":
-			if len(m.filterText) > 0 {
-				m.filterText = m.filterText[:len(m.filterText)-1]
-			}
-		default:
-			if len(msg.Runes) == 1 && len(m.filterText) < 40 {
-				m.filterText += string(msg.Runes[0])
-			}
-		}
-		m.scrollY = 0
-		return m, nil
-	}
-
-	// ── 全局快捷键 ──
-	switch key {
-	case "q", "ctrl+c":
-		return m, tea.Quit
-
-	case "t":
-		// 切换列表 / 树
-		m.scrollY = 0
-		if m.mode == ViewTree {
-			m.mode = ViewList
-		} else {
-			m.mode = ViewTree
-		}
-
-	case "?":
-		// 切换帮助
-		if m.mode == ViewHelp {
-			m.mode = ViewList
-		} else {
-			m.mode = ViewHelp
-		}
-
-	case "/":
-		// 进入过滤编辑模式
-		m.filtering = true
-
-	case "esc":
-		// 清除过滤
-		m.filterText = ""
-		m.scrollY = 0
-
-	case "s":
-		// 循环排序字段
-		m.sortField = (m.sortField + 1) % 4
-		m.sortProcs()
-		m.scrollY = 0
-
-	case "S":
-		// 切换升降序
-		m.sortDesc = !m.sortDesc
-		m.sortProcs()
-		m.scrollY = 0
-
-	case "j", "down":
-		m.scrollY++
-
-	case "k", "up":
-		if m.scrollY > 0 {
-			m.scrollY--
-		}
-
-	case "pgdown", "ctrl+d":
-		m.scrollY += (m.height - 6)
-		if m.scrollY < 0 {
-			m.scrollY = 0
-		}
-
-	case "pgup", "ctrl+u":
-		m.scrollY -= (m.height - 6)
-		if m.scrollY < 0 {
-			m.scrollY = 0
-		}
-
-	case "home", "g":
-		m.scrollY = 0
-
-	case "end", "G":
-		m.scrollY = 1 << 30 // 一个很大的数，view 层会 clamp
-	}
-
-	return m, nil
-}
-
-// ============================================================================
-// Bubble Tea View
-// ============================================================================
-
-func (m model) View() string {
-	if m.quit {
-		return ""
-	}
-	if m.width == 0 {
-		return "Initializing... (resize terminal if stuck)\n"
-	}
-
-	var b strings.Builder
-
-	// 顶部统计栏
-	b.WriteString(m.renderStatsBar())
-	b.WriteString("\n")
-
-	// 分隔线
-	b.WriteString(m.hLine())
-	b.WriteString("\n")
-
-	// 主内容区
+	// 3. Main content
 	switch m.mode {
-	case ViewList:
-		b.WriteString(m.renderList())
-	case ViewTree:
-		b.WriteString(m.renderTreeView())
-	case ViewHelp:
-		b.WriteString(m.renderHelp())
+	case viewList:
+		m.writeListView(&buf)
+	case viewTree:
+		m.writeTreeView(&buf)
+	case viewHelp:
+		m.writeHelpView(&buf)
 	}
 
-	// 底部状态栏
-	b.WriteString("\n")
-	b.WriteString(m.hLine())
-	b.WriteString("\n")
-	b.WriteString(m.renderStatusBar())
+	// 4. Footer
+	buf.WriteByte('\n')
+	m.writeHLine(&buf)
+	buf.WriteByte('\n')
+	m.writeStatusBar(&buf)
 
 	if m.lastErr != "" {
-		b.WriteString("\n")
-		b.WriteString(errStyle.Render(" ⚠ " + m.lastErr))
+		buf.WriteString("\n " + redFg("⚠ "+m.lastErr))
 	}
 
-	return b.String()
+	buf.WriteString("\033[J") // clear below
+	os.Stdout.WriteString(buf.String())
 }
 
-// ============================================================================
-// 渲染组件
-// ============================================================================
-
-func (m *model) hLine() string {
-	if m.width < 1 {
-		return ""
-	}
-	return strings.Repeat("─", m.width)
-}
-
-// renderStatsBar 顶部统计行
-func (m *model) renderStatsBar() string {
+func (m *model) writeStatsBar(buf *strings.Builder) {
 	if !m.ready {
-		return dimStyle.Render(" Loading...")
+		buf.WriteString(dimFg(" Loading..."))
+		return
 	}
 	s := m.stat
 	parts := []string{
-		titleStyle.Render(" Process Monitor "),
+		titleFg(" Process Monitor "),
 		fmt.Sprintf("Total:%d", s.Total),
-		stateStyle("R", stateRStyle).Render(fmt.Sprintf("R:%d", s.Running)),
-		stateStyle("S", dimStyle).Render(fmt.Sprintf("S:%d", s.Sleeping)),
-		stateStyle("D", warnStyle).Render(fmt.Sprintf("D:%d", s.Uninterruptible)),
-		stateStyle("Z", errStyle).Render(fmt.Sprintf("Z:%d", s.Zombie)),
-		stateStyle("T", dimStyle).Render(fmt.Sprintf("T:%d", s.Stopped)),
+		greenFg(fmt.Sprintf("R:%d", s.Running)),
+		dimFg(fmt.Sprintf("S:%d", s.Sleeping)),
+		warnFg(fmt.Sprintf("D:%d", s.Uninterruptible)),
+		redFg(fmt.Sprintf("Z:%d", s.Zombie)),
+		dimFg(fmt.Sprintf("T:%d", s.Stopped)),
 		fmt.Sprintf("KThr:%d", s.KernelThreads),
 		fmt.Sprintf("UThr:%d", s.UserThreads),
 	}
-	return strings.Join(parts, "  ")
+	buf.WriteString(strings.Join(parts, "  "))
 }
 
-// renderList 进程列表视图
-func (m *model) renderList() string {
+func (m *model) writeHLine(buf *strings.Builder) {
+	if m.width > 0 {
+		buf.WriteString(strings.Repeat("─", m.width))
+	}
+}
+
+func (m *model) writeListView(buf *strings.Builder) {
 	procs := m.filteredProcs()
-
-	// 可用高度
-	avail := m.height - 4 // 统计栏 + 两条分隔线 + 状态栏
+	avail := m.height - 4
 	if avail < 2 {
-		return ""
+		return
 	}
 
-	// 列头
-	header := fmt.Sprintf("%-7s %-7s %-18s %c %-4s %-8s %-9s %-9s %-10s %s",
-		"PID", "PPID", "NAME", 'S', "NICE", "THR",
-		"VSIZE", "RSS", "CPU(s)", "UID")
-
-	var b strings.Builder
-
-	// 过滤提示
+	// Sort/filter hint
 	if m.filterText != "" {
-		b.WriteString(filterStyle.Render(fmt.Sprintf(
-			" Filter: \"%s\" (%d matched)", m.filterText, len(procs))))
+		fmt.Fprintf(buf, " %s (%d matched)", filterFg("Filter: \""+m.filterText+"\""), len(procs))
 	} else {
-		b.WriteString(dimStyle.Render(fmt.Sprintf(
-			" Sort: %s %s", m.sortField.Label(), arrow(m.sortDesc))))
+		arrow := "▲"
+		if m.sortDesc {
+			arrow = "▼"
+		}
+		fmt.Fprintf(buf, " %s %s", dimFg("Sort:"+m.sortF.label()), dimFg(arrow))
 	}
-	b.WriteString("\n")
-	b.WriteString(tableHeaderStyle.Render(header))
-	b.WriteString("\n")
+	buf.WriteByte('\n')
 
-	// Clamp 滚动
+	// Table header
+	header := fmt.Sprintf("%-7s %-7s %-18s %c %-4s %-8s %-9s %-9s %-9s %s",
+		"PID", "PPID", "NAME", 'S', "NICE", "THR", "VSIZE", "RSS", "CPU(s)", "UID")
+	buf.WriteString(headerFg(header))
+	buf.WriteByte('\n')
+
+	// Scroll clamp
 	maxScroll := len(procs) - avail + 1
 	if maxScroll < 0 {
 		maxScroll = 0
@@ -727,43 +736,30 @@ func (m *model) renderList() string {
 
 	for i := start; i < end; i++ {
 		p := procs[i]
-		state := stateByte(p.State)
-
-		line := fmt.Sprintf("%-7d %-7d %-18.18s %c %-4d %-8d %-9s %-9s %-10.1f %d",
-			p.Pid, p.Ppid, cstr(p.Comm), state,
+		st := stateByte(p.State)
+		line := fmt.Sprintf("%-7d %-7d %-18.18s %c %-4d %-8d %-9s %-9s %-9.1f %d",
+			p.Pid, p.Ppid, cstr(p.Comm), st,
 			p.Nice, p.NumThreads,
 			formatSize(p.Vsize), formatSize(p.Rss*4096),
 			cpuSec(p), p.Uid)
-
-		// 按状态着色
-		switch state {
-		case 'R':
-			line = stateRStyle.Render(line)
-		case 'Z':
-			line = errStyle.Render(line)
-		case 'D':
-			line = warnStyle.Render(line)
-		default:
-			line = dimStyle.Render(line)
-		}
-		b.WriteString(line)
-		b.WriteString("\n")
+		buf.WriteString(stateColor(st)(line))
+		buf.WriteByte('\n')
 	}
-
-	return b.String()
 }
 
-// renderTreeView 进程树视图
-func (m *model) renderTreeView() string {
+func (m *model) writeTreeView(buf *strings.Builder) {
 	if m.treeRoot == nil {
-		return " No process tree data (is the kernel module loaded?)"
+		buf.WriteString(dimFg(" No process tree data"))
+		return
 	}
-
 	lines := m.treeRoot.renderLines()
 	avail := m.height - 4
 	if avail < 2 {
-		return ""
+		return
 	}
+
+	buf.WriteString(helpTitle(fmt.Sprintf(" Process Tree (%d nodes)", len(m.treeNodes))))
+	buf.WriteByte('\n')
 
 	maxScroll := len(lines) - avail
 	if maxScroll < 0 {
@@ -782,141 +778,156 @@ func (m *model) renderTreeView() string {
 		end = len(lines)
 	}
 
-	var b strings.Builder
-	b.WriteString(treeTitleStyle.Render(fmt.Sprintf(" Process Tree (%d nodes)", len(m.treeNodes))))
-	b.WriteString("\n")
-
 	for i := start; i < end; i++ {
-		line := lines[i]
-		// 树连接线用青色
-		b.WriteString(treeStyle.Render(line))
-		b.WriteString("\n")
+		buf.WriteString(treeLine(lines[i]))
+		buf.WriteByte('\n')
 	}
-
-	return b.String()
 }
 
-// renderHelp 帮助视图
-func (m *model) renderHelp() string {
+func (m *model) writeHelpView(buf *strings.Builder) {
 	lines := []string{
 		"",
-		helpTitleStyle.Render("  Key Bindings"),
+		helpTitle("  Key Bindings"),
 		"",
-		"  " + keyStyle.Render("q / Ctrl+C") + "    Quit",
-		"  " + keyStyle.Render("t") + "             Toggle process list / tree view",
-		"  " + keyStyle.Render("s") + "             Cycle sort: PID → CPU → MEM → NAME",
-		"  " + keyStyle.Render("S") + "             Toggle sort direction (asc / desc)",
-		"  " + keyStyle.Render("/") + "             Enter filter mode",
-		"  " + keyStyle.Render("Esc") + "           Clear filter",
-		"  " + keyStyle.Render("↑↓ / j k") + "     Scroll up / down",
-		"  " + keyStyle.Render("PgUp / PgDn") + "   Page up / down",
-		"  " + keyStyle.Render("g / Home") + "     Jump to top",
-		"  " + keyStyle.Render("G / End") + "      Jump to bottom",
-		"  " + keyStyle.Render("?") + "             Toggle this help",
+		"  " + keyFg("q / Ctrl+C") + "    Quit",
+		"  " + keyFg("t") + "             Toggle process list / tree view",
+		"  " + keyFg("s") + "             Cycle sort: PID → CPU → MEM → NAME",
+		"  " + keyFg("S") + "             Toggle sort direction",
+		"  " + keyFg("/") + "             Enter filter mode",
+		"  " + keyFg("Esc") + "           Clear filter",
+		"  " + keyFg("↑↓ / j k") + "     Scroll",
+		"  " + keyFg("PgUp / PgDn") + "   Page up / down",
+		"  " + keyFg("g / Home") + "     Jump to top",
+		"  " + keyFg("G / End") + "      Jump to bottom",
+		"  " + keyFg("?") + "             Toggle this help",
 		"",
-		helpTitleStyle.Render("  Filter Syntax"),
+		helpTitle("  Filter Syntax"),
 		"",
-		"  " + keyStyle.Render("systemd") + "      Match process name (case-insensitive substring)",
-		"  " + keyStyle.Render("=R") + "           Match by state (R/S/D/T/Z/I)",
-		"  " + keyStyle.Render(":1234") + "        Match by exact PID",
+		"  " + keyFg("systemd") + "      Match process name (case-insensitive substring)",
+		"  " + keyFg("=R") + "           Match by state (R/S/D/T/Z/I)",
+		"  " + keyFg(":1234") + "        Match by exact PID",
 		"",
-		helpTitleStyle.Render("  Data Source"),
+		helpTitle("  Data Source"),
 		"",
-		"  All data comes from 3 custom Linux syscalls (470/471/472):",
-		"    sys_proc_collect  — process info",
-		"    sys_proc_snapshot — process tree topology",
-		"    sys_proc_stat     — aggregate statistics",
+		"  All data from custom Linux syscalls (470/471/472).",
 		"  No /proc, ps, eBPF, or ptrace is used.",
 	}
-
-	return strings.Join(lines, "\n")
+	buf.WriteString(strings.Join(lines, "\n"))
 }
 
-// renderStatusBar 底部操作提示
-func (m *model) renderStatusBar() string {
+func (m *model) writeStatusBar(buf *strings.Builder) {
 	if m.filtering {
 		prompt := fmt.Sprintf(" Filter: %s█", m.filterText)
-		ret := filterStyle.Render(prompt)
-		hint := dimStyle.Render("  [Enter: apply  Esc: cancel]")
-		return ret + hint
+		buf.WriteString(filterFg(prompt))
+		buf.WriteString(dimFg("  [Enter: apply  Esc: cancel]"))
+		return
 	}
 
-	scrollInfo := fmt.Sprintf("%d/%d", m.scrollY,
-		func() int {
-			if m.mode == ViewTree && m.treeRoot != nil {
-				return len(m.treeRoot.renderLines())
-			}
-			return len(m.filteredProcs())
-		}())
+	totalLines := len(m.filteredProcs())
+	if m.mode == viewTree && m.treeRoot != nil {
+		totalLines = len(m.treeRoot.renderLines())
+	}
 
-	var parts []string
-	parts = append(parts, dimStyle.Render(scrollInfo))
-	parts = append(parts, keyHint("q", "quit"))
-	parts = append(parts, keyHint("/", "filter"))
-	parts = append(parts, keyHint("s", "sort"))
-	if m.mode == ViewTree {
-		parts = append(parts, keyHint("t", "list"))
+	scrollInfo := fmt.Sprintf("%d/%d", m.scrollY, totalLines)
+	parts := []string{
+		dimFg(scrollInfo),
+		keyFg("q") + " quit",
+		keyFg("/") + " filter",
+		keyFg("s") + " sort",
+	}
+	if m.mode == viewTree {
+		parts = append(parts, keyFg("t")+" list")
 	} else {
-		parts = append(parts, keyHint("t", "tree"))
+		parts = append(parts, keyFg("t")+" tree")
 	}
-	parts = append(parts, keyHint("?", "help"))
+	parts = append(parts, keyFg("?")+" help")
+	buf.WriteString(strings.Join(parts, "  "))
+}
 
-	// 右对齐填充
-	result := strings.Join(parts, "  ")
-	if m.width > len(result) {
-		result += strings.Repeat(" ", m.width-len(result))
+// ============================================================================
+// 事件处理
+// ============================================================================
+
+func (m *model) handleKey(ev keyEvent) {
+	// In filter mode, handle text input
+	if m.filtering {
+		switch ev.code {
+		case 13: // Enter
+			m.filtering = false
+		case 27: // Esc
+			m.filterText = ""
+			m.filtering = false
+		case 127: // Backspace
+			if len(m.filterText) > 0 {
+				m.filterText = m.filterText[:len(m.filterText)-1]
+			}
+		default:
+			if ev.code >= 32 && ev.code < 127 && len(m.filterText) < 40 {
+				m.filterText += string(ev.code)
+			}
+		}
+		m.scrollY = 0
+		return
 	}
-	return result
-}
 
-// ============================================================================
-// 样式定义
-// ============================================================================
+	// Normal mode
+	switch ev.code {
+	case 'q', 3: // q or Ctrl+C
+		m.quit = true
 
-var (
-	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("4")).Padding(0, 1)
-	tableHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Background(lipgloss.Color("8"))
-	helpTitleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-	treeTitleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-	treeStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))  // cyan connectors
-	keyStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Bold(true) // yellow keys
-	filterStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("3")) // yellow filter
-	dimStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("8")) // gray
-	stateRStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("2")) // green
-	warnStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("3")) // yellow
-	errStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("1")) // red
-)
+	case 't':
+		m.scrollY = 0
+		if m.mode == viewTree {
+			m.mode = viewList
+		} else {
+			m.mode = viewTree
+		}
 
-func stateStyle(name string, style lipgloss.Style) lipgloss.Style {
-	return style.Copy().Bold(true)
-}
+	case '?':
+		if m.mode == viewHelp {
+			m.mode = viewList
+		} else {
+			m.mode = viewHelp
+		}
 
-func keyHint(key, desc string) string {
-	return keyStyle.Render(key) + " " + dimStyle.Render(desc)
-}
+	case '/':
+		m.filtering = true
 
-func arrow(desc bool) string {
-	if desc {
-		return "▼"
-	}
-	return "▲"
-}
+	case 27: // Esc
+		m.filterText = ""
+		m.scrollY = 0
 
-// ============================================================================
-// 格式化工具
-// ============================================================================
+	case 's':
+		m.sortF = (m.sortF + 1) % 4
+		m.sortProcs()
+		m.scrollY = 0
 
-// formatSize 格式化字节数为可读字符串
-func formatSize(bytes uint64) string {
-	switch {
-	case bytes >= 1<<30:
-		return fmt.Sprintf("%.1fG", float64(bytes)/(1<<30))
-	case bytes >= 1<<20:
-		return fmt.Sprintf("%.1fM", float64(bytes)/(1<<20))
-	case bytes >= 1<<10:
-		return fmt.Sprintf("%.1fK", float64(bytes)/(1<<10))
-	default:
-		return fmt.Sprintf("%dB", bytes)
+	case 'S':
+		m.sortDesc = !m.sortDesc
+		m.sortProcs()
+
+	case 'j', keyDown:
+		m.scrollY++
+
+	case 'k', keyUp:
+		if m.scrollY > 0 {
+			m.scrollY--
+		}
+
+	case keyPgDn:
+		m.scrollY += m.height - 5
+
+	case keyPgUp:
+		m.scrollY -= m.height - 5
+		if m.scrollY < 0 {
+			m.scrollY = 0
+		}
+
+	case 'g', keyHome:
+		m.scrollY = 0
+
+	case 'G', keyEnd:
+		m.scrollY = 1 << 30 // clamped in render
 	}
 }
 
@@ -925,7 +936,7 @@ func formatSize(bytes uint64) string {
 // ============================================================================
 
 func main() {
-	// 验证结构体大小与内核一致（编译时安全网）
+	// 验证结构体大小
 	if unsafe.Sizeof(ProcInfo{}) != 80 {
 		fmt.Fprintf(os.Stderr, "FATAL: ProcInfo size=%d, expected 80\n", unsafe.Sizeof(ProcInfo{}))
 		os.Exit(1)
@@ -939,12 +950,56 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := initialModel()
+	// 设置原始终端模式
+	fd := os.Stdin.Fd()
+	oldTerm, err := setRaw(fd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to set raw terminal: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Try: sudo ./procmon\n")
+		os.Exit(1)
+	}
+	defer restoreTerm(fd, oldTerm)
+
+	// 进入 Alt Screen, 隐藏光标
+	fmt.Print("\033[?1049h")
+	fmt.Print("\033[?25l")
+
+	// 处理 SIGWINCH (虽然 raw mode 下 ISIG 关闭, 但可以手动捕获)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGWINCH)
+	defer signal.Stop(sigCh)
+
+	// 键盘输入
+	keyCh := make(chan keyEvent, 64)
+	go readStdin(keyCh)
+
+	// Ticker
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	m := &model{
+		mode:  viewList,
+		sortF: sortByPID,
+	}
 	m.fetchAll()
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+	// 事件循环
+	for !m.quit {
+		m.render()
+
+		select {
+		case <-ticker.C:
+			m.fetchAll()
+
+		case <-sigCh:
+			m.width, m.height = getTermSize()
+
+		case ev, ok := <-keyCh:
+			if !ok {
+				m.quit = true
+				break
+			}
+			m.handleKey(ev)
+		}
 	}
 }
