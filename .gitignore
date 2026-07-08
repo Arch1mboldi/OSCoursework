@@ -19,6 +19,10 @@
 user_app/proc_monitor
 user_app/test_syscall
 
+# Go 编译产物
+user_app_bubbletea/procmon
+user_app_bubbletea/go.sum
+
 # === 用户态程序运行时生成的文件 ===
 proc_tree.dot
 *.png

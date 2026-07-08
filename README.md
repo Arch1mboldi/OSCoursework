@@ -49,9 +49,12 @@ OSCoursework/
 │               └── syscall_64.tbl.patch # 系统调用表注册说明
 ├── user_app/
 │   ├── proc_monitor.h                   # 用户态头文件 (数据结构 + 系统调用号)
-│   ├── proc_monitor.c                   # 用户态监控主程序
+│   ├── proc_monitor.c                   # 用户态监控主程序 (C 命令行交互版)
 │   ├── test_syscall.c                   # 最小验证程序 (测试3个系统调用)
 │   └── Makefile                         # 用户态编译脚本
+├── user_app_bubbletea/
+│   ├── go.mod                           # Go 模块定义
+│   └── main.go                          # Go Bubble Tea TUI 监控程序
 ├── .gitignore
 └── README.md                            # 本文件
 ```
@@ -106,6 +109,49 @@ make test
 # 运行监控程序
 sudo ./proc_monitor
 ```
+
+### 3. Go TUI 版 (Bubble Tea)
+
+更精美的终端 UI，支持实时刷新、交互式过滤、进程树可视化：
+
+```bash
+# 安装 Go 1.21+ (如未安装)
+sudo apt install golang-go   # Ubuntu
+# 或从 https://go.dev/dl/ 下载
+
+cd OScoursework/user_app_bubbletea
+
+# 下载依赖并编译
+go mod tidy
+go build -o procmon .
+
+# 运行
+sudo ./procmon
+```
+
+**Go TUI 版功能：**
+
+| 功能 | 按键 | 说明 |
+|:---|:---|:---|
+| 实时刷新 | (自动) | 每秒自动刷新，状态栏实时更新 |
+| 过滤 | `/` | 输入过滤条件后 Enter 确认 |
+| 清除过滤 | `Esc` | |
+| 排序切换 | `s` | PID → CPU → MEM → NAME 循环 |
+| 排序方向 | `S` | 升序/降序切换 |
+| 进程树 | `t` | 切换列表/树视图，Unicode 缩进线 |
+| 滚动 | `↑↓` / `j k` | 逐行滚动 |
+| 翻页 | `PgUp` / `PgDn` | |
+| 跳转 | `g`=顶部 `G`=底部 | |
+| 帮助 | `?` | |
+
+**过滤语法：**
+
+| 输入 | 含义 |
+|:---|:---|
+| `systemd` | 进程名包含 "systemd" (忽略大小写) |
+| `=R` | 状态为 Running |
+| `=Z` | 状态为 Zombie |
+| `:1234` | PID 等于 1234 |
 
 ---
 
