@@ -640,97 +640,151 @@ func formatSize(bytes uint64) string {
 // 渲染
 // ============================================================================
 
+// render 绘制一帧。严格控制行数和列宽，杜绝撕裂和错位。
 func (m *model) render() {
 	m.width, m.height = getTermSize()
+	w := m.width
+	h := m.height
 
 	var buf strings.Builder
-	buf.WriteString("\033[H") // cursor to (0,0)
+	buf.WriteString("\033[2J\033[H") // 全清屏 + 光标归位
 
-	// 1. Stats bar
-	m.writeStatsBar(&buf)
-	buf.WriteByte('\n')
+	n := 0 // 已输出的逻辑行数
 
-	// 2. Separator
-	m.writeHLine(&buf)
-	buf.WriteByte('\n')
+	// 第1行: 统计摘要
+	writeLine(&buf, w, m.statsLine())
+	n++
 
-	// 3. Main content
-	switch m.mode {
-	case viewList:
-		m.writeListView(&buf)
-	case viewTree:
-		m.writeTreeView(&buf)
-	case viewHelp:
-		m.writeHelpView(&buf)
+	// 第2行: 分隔线
+	writeLine(&buf, w, strings.Repeat("─", w))
+	n++
+
+	// 第3至 h-2 行: 主内容
+	for _, line := range m.contentLines() {
+		if n >= h-1 {
+			break
+		}
+		writeLine(&buf, w, line)
+		n++
 	}
 
-	// 4. Footer
-	buf.WriteByte('\n')
-	m.writeHLine(&buf)
-	buf.WriteByte('\n')
-	m.writeStatusBar(&buf)
-
-	if m.lastErr != "" {
-		buf.WriteString("\n " + redFg("⚠ "+m.lastErr))
+	// 填充空白行至倒数第二行
+	for n < h-1 {
+		writeLine(&buf, w, "")
+		n++
 	}
 
-	buf.WriteString("\033[J") // clear below
+	// 最后一行: 状态栏
+	writeLine(&buf, w, m.statusLine())
+
+	buf.WriteString("\033[J") // 保险清除
 	os.Stdout.WriteString(buf.String())
 }
 
-func (m *model) writeStatsBar(buf *strings.Builder) {
+// writeLine 输出一行：截断至视觉宽度 w, 清 EOL, 换行
+func writeLine(buf *strings.Builder, w int, s string) {
+	buf.WriteString(truncLine(s, w))
+	buf.WriteString("\033[K\r\n")
+}
+
+// stripANSI 移除 ANSI SGR 序列 (ESC[...m), 返回纯文本
+func stripANSI(s string) string {
+	dst := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			j := i + 2
+			for j < len(s) && s[j] != 'm' {
+				j++
+			}
+			i = j // skip to 'm'
+			continue
+		}
+		dst = append(dst, s[i])
+	}
+	return string(dst)
+}
+
+// truncLine 将字符串截断到视觉宽度 w (忽略 ANSI 码)
+func truncLine(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	clean := stripANSI(s)
+	runes := []rune(clean)
+	if len(runes) <= w {
+		return s
+	}
+	// 有 ANSI 码时，简单截断原始字符串
+	// 对于纯文本行：截取 w-1 个 rune + "…"
+	if len(s) == len(clean) {
+		return string(runes[:w-1]) + "…"
+	}
+	// 含 ANSI 的行：粗暴截断（非精确但安全）
+	return s[:w]
+}
+
+// statsLine 单行统计摘要 (适配 80 列终端)
+func (m *model) statsLine() string {
 	if !m.ready {
-		buf.WriteString(dimFg(" Loading..."))
-		return
+		return "Loading..."
 	}
 	s := m.stat
-	parts := []string{
-		titleFg(" Process Monitor "),
-		fmt.Sprintf("Total:%d", s.Total),
+	return fmt.Sprintf("ProcMon T:%d %s %s %s %s %s  Kthr:%d Uthr:%d",
+		s.Total,
 		greenFg(fmt.Sprintf("R:%d", s.Running)),
 		dimFg(fmt.Sprintf("S:%d", s.Sleeping)),
 		warnFg(fmt.Sprintf("D:%d", s.Uninterruptible)),
 		redFg(fmt.Sprintf("Z:%d", s.Zombie)),
 		dimFg(fmt.Sprintf("T:%d", s.Stopped)),
-		fmt.Sprintf("KThr:%d", s.KernelThreads),
-		fmt.Sprintf("UThr:%d", s.UserThreads),
-	}
-	buf.WriteString(strings.Join(parts, "  "))
+		s.KernelThreads,
+		s.UserThreads,
+	)
 }
 
-func (m *model) writeHLine(buf *strings.Builder) {
-	if m.width > 0 {
-		buf.WriteString(strings.Repeat("─", m.width))
+// contentLines 返回主内容区所有行
+func (m *model) contentLines() []string {
+	switch m.mode {
+	case viewList:
+		return m.listLines()
+	case viewTree:
+		return m.treeLines()
+	case viewHelp:
+		return m.helpLines()
 	}
+	return nil
 }
 
-func (m *model) writeListView(buf *strings.Builder) {
+func (m *model) listLines() []string {
 	procs := m.filteredProcs()
-	avail := m.height - 4
-	if avail < 2 {
-		return
-	}
+	var lines []string
 
-	// Sort/filter hint
+	// 子标题行
 	if m.filterText != "" {
-		fmt.Fprintf(buf, " %s (%d matched)", filterFg("Filter: \""+m.filterText+"\""), len(procs))
+		lines = append(lines,
+			filterFg(fmt.Sprintf("Filter: %q  matched %d", m.filterText, len(procs))))
 	} else {
-		arrow := "▲"
+		arrow := "asc"
 		if m.sortDesc {
-			arrow = "▼"
+			arrow = "desc"
 		}
-		fmt.Fprintf(buf, " %s %s", dimFg("Sort:"+m.sortF.label()), dimFg(arrow))
+		lines = append(lines,
+			fmt.Sprintf("Sort: %s [%s]", m.sortF.label(), arrow))
 	}
-	buf.WriteByte('\n')
 
-	// Table header
-	header := fmt.Sprintf("%-7s %-7s %-18s %c %-4s %-8s %-9s %-9s %-9s %s",
-		"PID", "PPID", "NAME", 'S', "NICE", "THR", "VSIZE", "RSS", "CPU(s)", "UID")
-	buf.WriteString(headerFg(header))
-	buf.WriteByte('\n')
+	// 表头
+	header := fmt.Sprintf("%7s %7s %-16s %c %4s %6s %8s %8s %8s %s",
+		"PID", "PPID", "NAME", 'S', "NICE", "THR",
+		"VSIZE", "RSS", "CPU(s)", "UID")
+	lines = append(lines, headerFg(header))
 
-	// Scroll clamp
-	maxScroll := len(procs) - avail + 1
+	// 可用行数
+	avail := m.height - 5 // 2 顶栏 + 1 底栏 + 子标题 + 表头 = 至少 5
+	if avail < 0 {
+		avail = 0
+	}
+
+	// Clamp 滚动
+	maxScroll := len(procs) - avail
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -750,31 +804,31 @@ func (m *model) writeListView(buf *strings.Builder) {
 	for i := start; i < end; i++ {
 		p := procs[i]
 		st := stateByte(p.State)
-		line := fmt.Sprintf("%-7d %-7d %-18.18s %c %-4d %-8d %-9s %-9s %-9.1f %d",
+		line := fmt.Sprintf("%7d %7d %-16.16s %c %4d %6d %8s %8s %8.1f %d",
 			p.Pid, p.Ppid, cstr(p.Comm), st,
 			p.Nice, p.NumThreads,
 			formatSize(p.Vsize), formatSize(p.Rss*4096),
 			cpuSec(p), p.Uid)
-		buf.WriteString(stateColor(st)(line))
-		buf.WriteByte('\n')
+		lines = append(lines, stateColor(st)(line))
 	}
+	return lines
 }
 
-func (m *model) writeTreeView(buf *strings.Builder) {
+func (m *model) treeLines() []string {
 	if m.treeRoot == nil {
-		buf.WriteString(dimFg(" No process tree data"))
-		return
+		return []string{"No process tree data"}
 	}
-	lines := m.treeRoot.renderLines()
-	avail := m.height - 4
-	if avail < 2 {
-		return
+	all := m.treeRoot.renderLines()
+
+	var lines []string
+	lines = append(lines, helpTitle(fmt.Sprintf("Process Tree (%d nodes)", len(m.treeNodes))))
+
+	avail := m.height - 5
+	if avail < 0 {
+		avail = 0
 	}
 
-	buf.WriteString(helpTitle(fmt.Sprintf(" Process Tree (%d nodes)", len(m.treeNodes))))
-	buf.WriteByte('\n')
-
-	maxScroll := len(lines) - avail
+	maxScroll := len(all) - avail
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
@@ -787,74 +841,72 @@ func (m *model) writeTreeView(buf *strings.Builder) {
 
 	start := m.scrollY
 	end := start + avail
-	if end > len(lines) {
-		end = len(lines)
+	if end > len(all) {
+		end = len(all)
 	}
 
 	for i := start; i < end; i++ {
-		buf.WriteString(treeLine(lines[i]))
-		buf.WriteByte('\n')
+		lines = append(lines, treeLine(all[i]))
+	}
+	return lines
+}
+
+func (m *model) helpLines() []string {
+	return []string{
+		"",
+		helpTitle("Key Bindings"),
+		"",
+		"  " + keyFg("q/Ctrl+C") + "  Quit",
+		"  " + keyFg("t") + "        Toggle list / tree view",
+		"  " + keyFg("s") + "        Cycle sort: PID → CPU → MEM → NAME",
+		"  " + keyFg("S") + "        Toggle sort direction",
+		"  " + keyFg("/") + "        Enter filter mode",
+		"  " + keyFg("Esc") + "      Clear filter",
+		"  " + keyFg("j/k/↑↓") + "  Scroll",
+		"  " + keyFg("PgUp/Dn") + "  Page up / down",
+		"  " + keyFg("g/Home") + "   Top     " + keyFg("G/End") + "  Bottom",
+		"  " + keyFg("?") + "        Toggle help",
+		"",
+		helpTitle("Filter Syntax"),
+		"",
+		"  " + keyFg("systemd") + "   Name substring (case-insensitive)",
+		"  " + keyFg("=R") + "        State: R/S/D/T/Z/I",
+		"  " + keyFg(":1234") + "     Exact PID",
+		"",
+		helpTitle("Data Source"),
+		"",
+		"  sys_proc_collect(470)  sys_proc_snapshot(471)  sys_proc_stat(472)",
+		"  No /proc, ps, eBPF, or ptrace used.",
 	}
 }
 
-func (m *model) writeHelpView(buf *strings.Builder) {
-	lines := []string{
-		"",
-		helpTitle("  Key Bindings"),
-		"",
-		"  " + keyFg("q / Ctrl+C") + "    Quit",
-		"  " + keyFg("t") + "             Toggle process list / tree view",
-		"  " + keyFg("s") + "             Cycle sort: PID → CPU → MEM → NAME",
-		"  " + keyFg("S") + "             Toggle sort direction",
-		"  " + keyFg("/") + "             Enter filter mode",
-		"  " + keyFg("Esc") + "           Clear filter",
-		"  " + keyFg("↑↓ / j k") + "     Scroll",
-		"  " + keyFg("PgUp / PgDn") + "   Page up / down",
-		"  " + keyFg("g / Home") + "     Jump to top",
-		"  " + keyFg("G / End") + "      Jump to bottom",
-		"  " + keyFg("?") + "             Toggle this help",
-		"",
-		helpTitle("  Filter Syntax"),
-		"",
-		"  " + keyFg("systemd") + "      Match process name (case-insensitive substring)",
-		"  " + keyFg("=R") + "           Match by state (R/S/D/T/Z/I)",
-		"  " + keyFg(":1234") + "        Match by exact PID",
-		"",
-		helpTitle("  Data Source"),
-		"",
-		"  All data from custom Linux syscalls (470/471/472).",
-		"  No /proc, ps, eBPF, or ptrace is used.",
-	}
-	buf.WriteString(strings.Join(lines, "\n"))
-}
-
-func (m *model) writeStatusBar(buf *strings.Builder) {
+func (m *model) statusLine() string {
 	if m.filtering {
-		prompt := fmt.Sprintf(" Filter: %s█", m.filterText)
-		buf.WriteString(filterFg(prompt))
-		buf.WriteString(dimFg("  [Enter: apply  Esc: cancel]"))
-		return
+		return filterFg(fmt.Sprintf("Filter: %s█", m.filterText)) +
+			dimFg("  [Enter:ok  Esc:cancel]")
 	}
 
-	totalLines := len(m.filteredProcs())
+	total := len(m.filteredProcs())
 	if m.mode == viewTree && m.treeRoot != nil {
-		totalLines = len(m.treeRoot.renderLines())
+		total = len(m.treeRoot.renderLines())
 	}
 
-	scrollInfo := fmt.Sprintf("%d/%d", m.scrollY, totalLines)
-	parts := []string{
-		dimFg(scrollInfo),
-		keyFg("q") + " quit",
-		keyFg("/") + " filter",
-		keyFg("s") + " sort",
-	}
+	viewName := "LIST"
 	if m.mode == viewTree {
-		parts = append(parts, keyFg("t")+" list")
-	} else {
-		parts = append(parts, keyFg("t")+" tree")
+		viewName = "TREE"
+	} else if m.mode == viewHelp {
+		viewName = "HELP"
 	}
-	parts = append(parts, keyFg("?")+" help")
-	buf.WriteString(strings.Join(parts, "  "))
+
+	return fmt.Sprintf("%s | %s  %s  %s  %s  %s  %s",
+		dimFg(fmt.Sprintf("%d/%d", m.scrollY, total)),
+		keyFg("q")+"uit",
+		keyFg("/")+"filter",
+		keyFg("s")+"ort",
+		keyFg("t")+"="+viewName,
+		keyFg("?")+"help",
+		dimFg(m.sortF.label()),
+	)
 }
 
 // ============================================================================
