@@ -1,0 +1,54 @@
+# .gitignore — 进程监控系统调用项目
+#
+# 本仓库仅包含内核修改文件 + 用户态程序，不包含完整内核源码树。
+# 因此 .gitignore 非常精简，只忽略编译产物和编辑器临时文件。
+
+# === 编译产物 ===
+*.o
+*.out
+*.ko
+*.mod.c
+*.mod
+*.o.*
+*.d
+*.d.*
+*.symvers
+*.order
+
+# 用户态可执行文件 (忽略编译后的二进制，保留源码)
+user_app/proc_monitor
+user_app/test_syscall
+
+# === 用户态程序运行时生成的文件 ===
+proc_tree.dot
+*.png
+
+# === 编辑器 & IDE ===
+*~
+\#*\#
+*.swp
+*.swo
+.vscode/
+.idea/
+.cache/
+
+# === 系统杂项 ===
+.DS_Store
+Thumbs.db
+
+# === 压缩包 ===
+*.tar
+*.tar.xz
+*.tar.gz
+*.zip
+*.bz2
+*.gz
+*.xz
+
+# === 内核构建残留 (如果有人在仓库内编译内核) ===
+vmlinux*
+System.map*
+.config
+.config.old
+Module.symvers
+modules.order

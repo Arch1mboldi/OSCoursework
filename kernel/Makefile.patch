@@ -1,0 +1,16 @@
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -XXX,3 +XXX,4 @@
+ # 在 obj-y 列表附近添加一行:
++obj-y += proc_monitor.o
+
+# ===== 操作说明 =====
+# 1. 编辑 kernel/Makefile
+# 2. 搜索 "obj-y"，找到内核核心对象文件列表
+# 3. 在合适位置添加: obj-y += proc_monitor.o
+#    或者为了能够通过配置开关控制:
+#    obj-$(CONFIG_PROC_MONITOR) += proc_monitor.o
+#    (后者还需要在 kernel/Kconfig 中添加配置项)
+#
+# 推荐直接使用 obj-y，无条件编译，避免额外配置:
+#   echo "obj-y += proc_monitor.o" >> kernel/Makefile
