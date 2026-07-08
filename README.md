@@ -79,9 +79,9 @@ echo "obj-y += proc_monitor.o" >> ~/linux-6.18/kernel/Makefile
 #       471  common  proc_snapshot  sys_proc_snapshot
 #       472  common  proc_stat      sys_proc_stat
 
-# (4) 编译内核
+# (4) 编译内核 (推荐 localmodconfig，只编译用到的模块，5-15 分钟)
 cd ~/linux-6.18
-make olddefconfig
+make localmodconfig
 make -j$(nproc)
 make modules -j$(nproc)
 
