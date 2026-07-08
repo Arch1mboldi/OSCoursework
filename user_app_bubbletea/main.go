@@ -141,44 +141,57 @@ func buildTree(nodes []ProcTreeNode) *TreeNode {
 	for _, n := range nodes {
 		nodeMap[n.Pid] = &TreeNode{Info: n}
 	}
+	hasParent := make(map[int32]bool)
 	var root *TreeNode
 	for _, n := range nodes {
 		node := nodeMap[n.Pid]
 		if parent, ok := nodeMap[n.Ppid]; ok && n.Pid != n.Ppid {
 			parent.Children = append(parent.Children, node)
+			hasParent[n.Pid] = true
 		} else if n.Pid == 1 || n.Ppid == 0 {
 			root = node
 		}
 	}
+	// 孤儿节点挂到 init 下 (仅当未被挂载过)
 	for _, n := range nodes {
-		if _, hasParent := nodeMap[n.Ppid]; !hasParent && n.Pid != 1 {
+		if !hasParent[n.Pid] && n.Pid != 1 {
 			if initNode, ok := nodeMap[1]; ok {
 				initNode.Children = append(initNode.Children, nodeMap[n.Pid])
+				hasParent[n.Pid] = true
 			}
 		}
 	}
 	if root != nil {
-		sortTree(root)
+		sortTree(root, make(map[*TreeNode]bool))
 	}
 	return root
 }
 
-func sortTree(n *TreeNode) {
+func sortTree(n *TreeNode, visited map[*TreeNode]bool) {
+	if visited[n] {
+		return // 环检测
+	}
+	visited[n] = true
 	sort.Slice(n.Children, func(i, j int) bool {
 		return n.Children[i].Info.Pid < n.Children[j].Info.Pid
 	})
 	for _, c := range n.Children {
-		sortTree(c)
+		sortTree(c, visited)
 	}
 }
 
 func (n *TreeNode) renderLines() []string {
 	var lines []string
-	n.render(&lines, "", true)
+	n.render(&lines, "", true, make(map[*TreeNode]bool))
 	return lines
 }
 
-func (n *TreeNode) render(lines *[]string, prefix string, isLast bool) {
+func (n *TreeNode) render(lines *[]string, prefix string, isLast bool, visited map[*TreeNode]bool) {
+	if visited[n] {
+		*lines = append(*lines, prefix+"... (cycle)")
+		return
+	}
+	visited[n] = true
 	connector := "├── "
 	if isLast {
 		connector = "└── "
@@ -190,7 +203,7 @@ func (n *TreeNode) render(lines *[]string, prefix string, isLast bool) {
 		childPrefix = prefix + "    "
 	}
 	for i, child := range n.Children {
-		child.render(lines, childPrefix, i == len(n.Children)-1)
+		child.render(lines, childPrefix, i == len(n.Children)-1, visited)
 	}
 }
 
