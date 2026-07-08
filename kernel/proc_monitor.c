@@ -8,9 +8,9 @@
  *   sys_proc_stat     — 系统整体进程统计
  *
  * 系统调用号 (x86_64):
- *   462  proc_collect
- *   463  proc_snapshot
- *   464  proc_stat
+ *   470  proc_collect
+ *   471  proc_snapshot
+ *   472  proc_stat
  *
  * 安全设计:
  *   - 所有用户态数据通过 copy_to_user() 传递，杜绝内核指针泄露

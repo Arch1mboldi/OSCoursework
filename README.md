@@ -15,20 +15,20 @@
 
 | 系统调用 | 编号 | 功能 |
 |:---|:---|:---|
-| `sys_proc_collect` | 462 | 一次性收集所有进程的完整信息 (PID/PPID/状态/CPU时间/内存/线程数/UID) |
-| `sys_proc_snapshot` | 463 | 返回进程树父子关系拓扑快照 (含层级深度) |
-| `sys_proc_stat` | 464 | 返回系统整体进程统计 (按状态分类 + 内核线程/用户进程) |
+| `sys_proc_collect` | 470 | 一次性收集所有进程的完整信息 (PID/PPID/状态/CPU时间/内存/线程数/UID) |
+| `sys_proc_snapshot` | 471 | 返回进程树父子关系拓扑快照 (含层级深度) |
+| `sys_proc_stat` | 472 | 返回系统整体进程统计 (按状态分类 + 内核线程/用户进程) |
 
 ### 用户态程序功能
 
-| 功能 | 命令 | 说明 |
-|:---|:---|:---|
-| 统计摘要 | `stat` | 进程总数、各状态分布、内核/用户线程数 |
-| 进程列表 | `list` | 表格展示所有进程，支持排序与多条件过滤 |
-| 进程树导出 | `tree <file>` | 导出为 Graphviz DOT 格式，可渲染为 PNG |
-| 实时刷新 | `watch` | 每2秒自动刷新，类 `top` 体验 |
-| 排序 | `sort pid/cpu/mem/name` | 按指定字段排序 |
-| 过滤 | `filter pid=N` / `filter name=XXX` | 多条件联合过滤 |
+| 功能    | 命令                                 | 说明                           |
+| :---- | :--------------------------------- | :--------------------------- |
+| 统计摘要  | `stat`                             | 进程总数、各状态分布、内核/用户线程数          |
+| 进程列表  | `list`                             | 表格展示所有进程，支持排序与多条件过滤          |
+| 进程树导出 | `tree <file>`                      | 导出为 Graphviz DOT 格式，可渲染为 PNG |
+| 实时刷新  | `watch`                            | 每2秒自动刷新，类 `top` 体验           |
+| 排序    | `sort pid/cpu/mem/name`            | 按指定字段排序                      |
+| 过滤    | `filter pid=N` / `filter name=XXX` | 多条件联合过滤                      |
 
 ---
 
@@ -75,9 +75,9 @@ echo "obj-y += proc_monitor.o" >> ~/linux-6.18/kernel/Makefile
 # (3) 注册系统调用号
 #     编辑 ~/linux-6.18/arch/x86/entry/syscalls/syscall_64.tbl
 #     在末尾添加:
-#       462  common  proc_collect   sys_proc_collect
-#       463  common  proc_snapshot  sys_proc_snapshot
-#       464  common  proc_stat      sys_proc_stat
+#       470  common  proc_collect   sys_proc_collect
+#       471  common  proc_snapshot  sys_proc_snapshot
+#       472  common  proc_stat      sys_proc_stat
 
 # (4) 编译内核
 cd ~/linux-6.18

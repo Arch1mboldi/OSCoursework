@@ -3,9 +3,9 @@
  *
  * ===== 核心约束 =====
  * 本程序通过 syscall() 直接调用 3 个自定义系统调用来获取数据:
- *   - sys_proc_collect  (462): 收集所有进程完整信息
- *   - sys_proc_snapshot (463): 进程树拓扑快照
- *   - sys_proc_stat     (464): 系统进程聚合统计
+ *   - sys_proc_collect  (470): 收集所有进程完整信息
+ *   - sys_proc_snapshot (471): 进程树拓扑快照
+ *   - sys_proc_stat     (472): 系统进程聚合统计
  *
  * 严格禁止使用: ps 命令、/proc 文件系统、eBPF、ptrace 等旁路手段。
  *

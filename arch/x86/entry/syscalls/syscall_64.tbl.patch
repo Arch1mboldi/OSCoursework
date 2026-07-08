@@ -1,16 +1,23 @@
 --- a/arch/x86/entry/syscalls/syscall_64.tbl
 +++ b/arch/x86/entry/syscalls/syscall_64.tbl
-@@ -XXX,3 +XXX,6 @@
- # 在文件末尾添加以下三行 (系统调用号需根据实际最后一条递增)
-+# 如果当前最后一条是 461，则从 462 开始
-+462	common	proc_collect		sys_proc_collect
-+463	common	proc_snapshot		sys_proc_snapshot
-+464	common	proc_stat		sys_proc_stat
+@@ -469,3 +469,6 @@
+ # 当前最后一条 common 系统调用是 469 (file_setattr)
++# 紧接着在 469 之后添加，使用 470/471/472:
++470	common	proc_collect		sys_proc_collect
++471	common	proc_snapshot		sys_proc_snapshot
++472	common	proc_stat		sys_proc_stat
 
 # ===== 操作说明 =====
-# 1. 查看当前最大系统调用号:
-#      tail -5 arch/x86/entry/syscalls/syscall_64.tbl
-# 2. 在文件末尾添加上述三行，确保系统调用号连续
+# 1. 当前 syscall_64.tbl 末尾:
+#    465  common  listxattrat             sys_listxattrat
+#    466  common  removexattrat           sys_removexattrat
+#    467  common  open_tree_attr          sys_open_tree_attr
+#    468  common  file_getattr            sys_file_getattr
+#    469  common  file_setattr            sys_file_setattr
+#    512-547 为 x32 历史兼容范围，不可使用
+#    548+ 也可用，但 470-472 是自然延续
+#
+# 2. 在 469 之后、x32 范围之前添加上述三行
 # 3. 格式: <号> <abi> <名称> <入口函数>
 #    - common = 64位 和 x32 ABI 均可用
 #    - 入口函数名与 SYSCALL_DEFINE 宏参数对应:

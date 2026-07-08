@@ -13,9 +13,9 @@
 #define TASK_COMM_LEN 16
 
 /* ---- 系统调用号 (必须与内核注册的一致) ---- */
-#define SYS_proc_collect  462
-#define SYS_proc_snapshot 463
-#define SYS_proc_stat     464
+#define SYS_proc_collect  470
+#define SYS_proc_snapshot 471
+#define SYS_proc_stat     472
 
 /* ---- 数据结构 (必须与内核定义字节级兼容) ---- */
 
