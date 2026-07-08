@@ -30,6 +30,7 @@
  *   (需要 root 权限才能调用自定义系统调用)
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
