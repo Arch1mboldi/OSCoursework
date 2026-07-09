@@ -22,6 +22,8 @@
 #include <linux/syscalls.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/sched/cputime.h>
+#include <linux/jiffies.h>
 #include <linux/uaccess.h>
 #include <linux/cred.h>
 #include <linux/pid.h>
@@ -74,9 +76,15 @@ SYSCALL_DEFINE3(proc_collect,
 		/* 进程状态 (Linux 6.x 使用 __state) */
 		kinfo.state = task->__state;
 
-		/* CPU 时间 (以时钟滴答为单位) */
-		kinfo.utime = task->utime;
-		kinfo.stime = task->stime;
+		/* CPU time: task_cputime() -> nanoseconds, then
+		 * nsec_to_clock_t() -> USER_HZ ticks (sysconf(_SC_CLK_TCK)).
+		 * This matches /proc/[pid]/stat behaviour. */
+		{
+			u64 ut_ns, st_ns;
+			task_cputime(task, &ut_ns, &st_ns);
+			kinfo.utime = nsec_to_clock_t(ut_ns);
+			kinfo.stime = nsec_to_clock_t(st_ns);
+		}
 
 		/* 内存信息: 内核线程 mm==NULL，无用户态内存 */
 		if (task->mm) {
