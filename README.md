@@ -19,16 +19,65 @@
 | `sys_proc_snapshot` | 471 | 返回进程树父子关系拓扑快照 (含层级深度) |
 | `sys_proc_stat` | 472 | 返回系统整体进程统计 (按状态分类 + 内核线程/用户进程) |
 
-### 用户态程序功能
+### 用户态程序 (ncurses 调试版 TUI)
 
-| 功能    | 命令                                 | 说明                           |
-| :---- | :--------------------------------- | :--------------------------- |
-| 统计摘要  | `stat`                             | 进程总数、各状态分布、内核/用户线程数          |
-| 进程列表  | `list`                             | 表格展示所有进程，支持排序与多条件过滤          |
-| 进程树导出 | `tree <file>`                      | 导出为 Graphviz DOT 格式，可渲染为 PNG |
-| 实时刷新  | `watch`                            | 每2秒自动刷新，类 `top` 体验           |
-| 排序    | `sort pid/cpu/mem/name`            | 按指定字段排序                      |
-| 过滤    | `filter pid=N` / `filter name=XXX` | 多条件联合过滤                      |
+`user_app/proc_monitor.c` 是一个以**调试友好**为设计目标的 ncurses 终端界面，
+面向开发人员调试内核模块时使用。
+
+**面板布局 (4 区域):**
+
+| 面板 | 内容 |
+|:---|:---|
+| win_main | 主视图区域，5 种模式可切换 |
+| win_detail | 选中进程的**全部 11 个 `proc_info` 字段** + `__state`/`exit_state` 位解码 |
+| win_syscall | 系统调用返回值 / errno / **延迟(μs)** / `proc_stat` 聚合统计 |
+| win_hint | 按键提示栏 |
+
+**5 种视图模式 (按 `v` 循环, 或数字键 `1`-`5` 直达):**
+
+| 模式 | 说明 |
+|:---|:---|
+| **LIST** `[1]` | 紧凑进程表格 — 含 state hex 原始值、CPU%、所有 11 字段 |
+| **DEBUG-TABLE** `[2]` | **所有字段作为原始数值** — 不做任何格式化/单位转换，与内核传回数据逐字节一致 |
+| **TREE** `[3]` | 进程树层次结构 — Unicode 树线绘制，按深度着色 |
+| **HEX-DUMP** `[4]` | 选中进程 `proc_info` 的**原始字节** + 字段偏移标注 (验证 struct 布局) |
+| **SYSCALL** `[5]` | 系统调用诊断面板 — 返回值 / errno / 耗时 / struct 大小 / cross-validation |
+
+**调试特性:**
+
+| 特性 | 说明 |
+|:---|:---|
+| 状态位解码 | state 字段分解为 `__state` 位 (INTR\|UNINTR\|STOP\|TRACE\|DEAD\|WAKEKILL) + `exit_state` 位 (ZOMBIE\|DEAD) |
+| 系统调用计时 | `clock_gettime(CLOCK_MONOTONIC)` 测量每个 syscall 的 wall-clock 延迟 (微秒) |
+| 交叉验证 | SYSCALL 视图对比 `proc_info[]` 计数 vs `proc_stat`，标记 MISMATCH |
+| 原始导出 | LIST/DEBUG → CSV / TREE → DOT (Graphviz) / HEX/SYSCALL → 二进制 dump (带 magic header) |
+| Struct 大小 | 启动时打印 `sizeof(proc_info/tree_node/stat)` 到 stderr，方便与内核对比 |
+| Hex state 过滤 | 支持 `=0x22` 精确匹配 state 位掩码，方便调试特定状态组合 |
+
+**按键绑定:**
+
+| 按键 | 功能 |
+|:---|:---|
+| `v` / `1`-`5` | 切换视图模式 |
+| `↑↓` / `j` `k` | 选择进程 |
+| `PgUp` / `PgDn` | 翻页 |
+| `Home` / `End` | 跳转到首/尾 |
+| `Tab` | 循环排序字段 (PID → CPU → MEM → NAME) |
+| `s` | 切换升序/降序 |
+| `/` | 进入过滤模式 |
+| `r` | 清除过滤 |
+| `x` | 导出 (CSV / DOT / RAW) |
+| `h` / `?` | 帮助 |
+| `q` / `ESC` | 退出 |
+
+**过滤语法:**
+
+| 输入 | 含义 |
+|:---|:---|
+| `bash` | 进程名包含 "bash" (大小写不敏感) |
+| `=R` | 状态为 Running |
+| `=0x22` | state 位掩码精确匹配 0x22 (调试!) |
+| `:1234` | PID 等于 1234 |
 
 ---
 
@@ -49,7 +98,7 @@ OSCoursework/
 │               └── syscall_64.tbl.patch # 系统调用表注册说明
 ├── user_app/
 │   ├── proc_monitor.h                   # 用户态头文件 (数据结构 + 系统调用号)
-│   ├── proc_monitor.c                   # 用户态监控主程序 (C 命令行交互版)
+│   ├── proc_monitor.c                   # 用户态监控主程序 (C ncurses 调试版 TUI, 5视图模式)
 │   ├── test_syscall.c                   # 最小验证程序 (测试3个系统调用)
 │   └── Makefile                         # 用户态编译脚本
 ├── user_app_bubbletea/
@@ -98,6 +147,9 @@ sudo reboot
 ### 2. 用户态：编译、验证、运行
 
 ```bash
+# 安装依赖 (ncurses 开发库)
+sudo apt install libncurses-dev
+
 cd OScoursework/user_app
 
 # 编译
@@ -106,13 +158,13 @@ make
 # 验证系统调用可用
 make test
 
-# 运行监控程序
+# 运行 ncurses 调试版监控程序 (需要 root 权限才能调用自定义 syscall)
 sudo ./proc_monitor
 ```
 
-### 3. Go TUI 版 (Bubble Tea)
+### 3. Go TUI 版 (纯标准库)
 
-更精美的终端 UI，支持实时刷新、交互式过滤、进程树可视化：
+Go 语言版本，零外部依赖 (仅 Go 标准库)，纯 ANSI 终端渲染：
 
 ```bash
 # 安装 Go 1.21+ (如未安装)
