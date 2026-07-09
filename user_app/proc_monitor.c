@@ -305,7 +305,6 @@ static int tree_has_continuation(int i, int count, int target_level)
 	int j;
 
 	while (cur_level > target_level) {
-		pid_t target_ppid = -1;
 		int found = 0;
 		for (j = 0; j < count; j++) {
 			if (g_tree_nodes[j].pid == ancestor_pid) {
@@ -788,9 +787,13 @@ int main(void)
 				{
 					char buf[256];
 					if (fgets(buf, sizeof(buf), stdin)
-					    && buf[0] != '\n')
-						strncpy(fname, buf,
-							sizeof(fname) - 1);
+					    && buf[0] != '\n') {
+						size_t l = strlen(buf);
+						if (l > 0 && buf[l-1] == '\n')
+							buf[l-1] = '\0';
+						snprintf(fname, sizeof(fname),
+							 "%s", buf);
+					}
 				}
 				reset_prog_mode();
 				refresh();
