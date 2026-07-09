@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <locale.h>
 #include <langinfo.h>
+#include <sys/time.h>
 #include <ncurses.h>
 #include "proc_monitor.h"
 
@@ -83,6 +84,15 @@ static int  g_filter_mode   = 0; /* 是否正在输入过滤条件 */
 static char g_cmd[MAX_CMD_LEN];
 static int  g_cmd_pos = 0;
 
+/* CPU% 计算: 记录上一帧每进程的 CPU 滴答 + 时间戳 */
+struct prev_cpu {
+	pid_t pid;
+	unsigned long total;  /* utime + stime, clock ticks */
+};
+static struct prev_cpu g_prev[MAX_PROCS];
+static int             g_prev_count = 0;
+static struct timeval  g_last_tv;
+
 /* 上次错误/提示 */
 static char g_last_msg[256] = "";
 
@@ -127,9 +137,66 @@ static const char *state_name(int state)
 	}
 }
 
-static double cpu_sec(const struct proc_info *p)
+static double cpu_utime_sec(const struct proc_info *p)
 {
-	return (double)(p->utime + p->stime) / (double)clk_tck;
+	return (double)p->utime / (double)clk_tck;
+}
+static double cpu_stime_sec(const struct proc_info *p)
+{
+	return (double)p->stime / (double)clk_tck;
+}
+
+/* CPU%: 与上一帧的 CPU 滴答差 / (clk_tck * elapsed) */
+static int cmp_prev_pid(const void *a, const void *b)
+{
+	const struct prev_cpu *pa = a, *pb = b;
+	return (pa->pid > pb->pid) - (pa->pid < pb->pid);
+}
+
+static double cpu_pct(pid_t pid, unsigned long cur_total)
+{
+	struct prev_cpu key = { .pid = pid };
+	struct prev_cpu *found;
+	unsigned long prev_total;
+	double elapsed;
+
+	if (g_prev_count <= 0)
+		return 0.0;
+
+	found = bsearch(&key, g_prev, g_prev_count,
+			sizeof(struct prev_cpu), cmp_prev_pid);
+	if (!found)
+		return 0.0;
+
+	prev_total = found->total;
+	if (cur_total < prev_total)
+		return 0.0;  /* PID reused, 重置 */
+
+	{
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		elapsed = (now.tv_sec  - g_last_tv.tv_sec) +
+			  (now.tv_usec - g_last_tv.tv_usec) / 1000000.0;
+	}
+	if (elapsed <= 0.0)
+		return 0.0;
+
+	return (double)(cur_total - prev_total)
+	       / (double)clk_tck / elapsed * 100.0;
+}
+
+/* 保存当前帧各进程 CPU 值, 供下一帧计算 CPU% */
+static void save_prev_cpu(void)
+{
+	int i;
+	g_prev_count = 0;
+	for (i = 0; i < g_proc_count && i < MAX_PROCS; i++) {
+		g_prev[i].pid   = g_procs[i].pid;
+		g_prev[i].total = g_procs[i].utime + g_procs[i].stime;
+		g_prev_count++;
+	}
+	qsort(g_prev, g_prev_count, sizeof(struct prev_cpu), cmp_prev_pid);
+	gettimeofday(&g_last_tv, NULL);
 }
 
 static const char *fmt_size(unsigned long bytes)
@@ -464,9 +531,10 @@ static void gui_redraw(void)
 			  g_last_msg);
 
 		mvwprintw(win_main, 2, 2,
-			  "%-7s %-7s %-18s %c %-4s %-6s %-8s %-8s %-8s %s",
-			  "PID", "PPID", "NAME", 'S', "NICE", "THR",
-			  "VSIZE", "RSS", "CPU(s)", "UID");
+			  "%-7s %-7s %-14s %c %-7s %-7s %-6s %-8s %-8s %s",
+			  "PID", "PPID", "NAME", 'S',
+			  "UTIME", "STIME", "CPU%",
+			  "VSIZE", "RSS", "UID");
 		mvwhline(win_main, 3, 1, ACS_HLINE, cols - 2);
 
 		{   /* 统计过滤后数量 + clamp 滚动 */
@@ -506,13 +574,17 @@ static void gui_redraw(void)
 					wattron(win_main, COLOR_PAIR(cp));
 
 				mvwprintw(win_main, row, 2,
-					  "%-7d %-7d %-18.18s %c %-4d "
-					  "%-6d %-8s %-8s %-8.1f %d",
+					  "%-7d %-7d %-14.14s %c "
+					  "%-7.1f %-7.1f %-5.1f "
+					  "%-8s %-8s %d",
 					  p->pid, p->ppid, cstr(p->comm), st,
-					  p->nice, p->num_threads,
+					  cpu_utime_sec(p),
+					  cpu_stime_sec(p),
+					  cpu_pct(p->pid,
+						  p->utime + p->stime),
 					  fmt_size(p->vsize),
 					  fmt_size(p->rss * 4096),
-					  cpu_sec(p), p->uid);
+					  p->uid);
 
 				if (cp && shown != g_selected)
 					wattroff(win_main, COLOR_PAIR(cp));
@@ -599,11 +671,17 @@ static void gui_redraw(void)
 				const struct proc_info *p = &g_procs[sel_idx];
 				mvwprintw(win_info, 0, 2,
 					  "PID=%-6d PPID=%-6d %s(%c) "
-					  "CPU=%.1fs VSIZE=%s RSS=%s",
+					  "UTIME=%.1fs STIME=%.1fs "
+					  "CPU%%=%.1f NICE=%d THR=%d "
+					  "VSIZE=%s RSS=%s",
 					  p->pid, p->ppid,
 					  state_name(p->state),
 					  state_char(p->state),
-					  cpu_sec(p),
+					  cpu_utime_sec(p),
+					  cpu_stime_sec(p),
+					  cpu_pct(p->pid,
+						  p->utime + p->stime),
+					  p->nice, p->num_threads,
 					  fmt_size(p->vsize),
 					  fmt_size(p->rss * 4096));
 			} else {
@@ -677,6 +755,7 @@ int main(void)
 		return 1;
 	}
 	sort_procs();
+	save_prev_cpu();   /* 首帧: CPU% = 0 */
 
 	while (g_running) {
 		gui_redraw();
@@ -684,6 +763,7 @@ int main(void)
 		ch = wgetch(win_input);
 
 		if (ch == ERR) {
+			save_prev_cpu();  /* 保存当前值供下一帧算增量 */
 			update_data();
 			sort_procs();
 			continue;
