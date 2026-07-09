@@ -18,6 +18,8 @@
 # 用户态可执行文件 (忽略编译后的二进制，保留源码)
 user_app/proc_monitor
 user_app/test_syscall
+user_app/test
+user_app/*.o
 
 # Go 编译产物
 user_app_bubbletea/procmon
