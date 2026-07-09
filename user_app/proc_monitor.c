@@ -1,490 +1,816 @@
 /*
- * user_app/proc_monitor.c — Linux 进程全量监控与分析系统 (用户态)
+ * proc_monitor.c — Linux 进程全量监控 TUI (ncurses 版)
  *
- * ===== 核心约束 =====
- * 本程序通过 syscall() 直接调用 3 个自定义系统调用来获取数据:
- *   - sys_proc_collect  (470): 收集所有进程完整信息
- *   - sys_proc_snapshot (471): 进程树拓扑快照
- *   - sys_proc_stat     (472): 系统进程聚合统计
+ * 通过自定义系统调用 (470/471/472) 获取数据。
+ * 模仿 osfs-system/gui.c 的多面板 ncurses 布局风格。
  *
- * 严格禁止使用: ps 命令、/proc 文件系统、eBPF、ptrace 等旁路手段。
+ * 面板布局:
+ *   win_main   — 进程列表 / 进程树 (主体)
+ *   win_info   — 选中进程详情 / 统计摘要
+ *   win_status — 状态栏 (总数/排序/过滤)
+ *   win_input  — 命令输入栏
  *
- * ===== 功能 =====
- *   stat                查看系统进程统计摘要
- *   list                显示进程列表 (支持排序/过滤)
- *   tree <file>         导出进程树 (Graphviz DOT 格式)
- *   watch               实时刷新模式 (2秒间隔)
- *   sort pid|cpu|mem|name  设置排序字段
- *   order               切换升序/降序
- *   filter pid=N        按 PID 过滤
- *   filter name=XXX     按进程名过滤
- *   filter off          关闭过滤
- *   help                显示帮助
- *   quit                退出
+ * 操作:
+ *   方向键/↑↓  选择进程
+ *   Enter     查看详情 / 执行命令
+ *   Tab       切换排序字段
+ *   t         切换列表/树视图
+ *   /         输入过滤条件
+ *   r         清除过滤
+ *   s         切换升降序
+ *   h         帮助
+ *   q/ESC     退出
  *
- * ===== 编译 =====
- *   gcc -Wall -Wextra -O2 -std=c11 -o proc_monitor proc_monitor.c
+ * 命令:
+ *   sort pid|cpu|mem|name
+ *   filter <text>  |  filter =R  |  filter :1234
+ *   filter off
+ *   tree            — 显示进程树
+ *   list            — 显示进程列表
  *
- * ===== 运行 =====
- *   sudo ./proc_monitor
- *   (需要 root 权限才能调用自定义系统调用)
+ * 编译: gcc -Wall -O2 -o proc_monitor proc_monitor.c -lncurses
  */
 
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/syscall.h>
-#include <signal.h>
 #include <sys/ioctl.h>
+#include <signal.h>
+#include <ncurses.h>
 #include "proc_monitor.h"
 
-/* ---- 常量 ---- */
-#define MAX_PROCS    4096        /* 最大进程数 */
-#define REFRESH_SEC  2           /* 实时刷新间隔 (秒) */
-
-/* ---- 全局状态 ---- */
-static struct proc_info      g_procs[MAX_PROCS];
-static struct proc_tree_node g_tree[MAX_PROCS];
-static struct proc_stat      g_stat;
-static int g_proc_count = 0;
-static int g_tree_count = 0;
-
-/* 排序与过滤 */
-static int  g_sort_field = 0;     /* 0=pid, 1=cpu, 2=mem, 3=name */
-static int  g_sort_desc  = 0;     /* 0=升序, 1=降序 */
-static char g_filter_name[256] = "";
-static pid_t g_filter_pid = 0;
-static int  g_filter_active = 0;
-
-/* 运行控制 */
-static volatile sig_atomic_t g_running = 1;
-
 /* ===================================================================
- * 系统调用包装层
- *
- * 这是本程序获取进程数据的唯一入口。每个函数通过 syscall()
- * 直接陷入内核，调用对应的自定义系统调用。
+ * 常量
  * =================================================================== */
 
-static int call_proc_collect(void)
+#define MAX_PROCS     8192
+#define MAX_CMD_LEN   256
+#define HZ            100     /* Linux x86_64 标准 ticks/sec */
+
+/* ===================================================================
+ * ncurses 窗口
+ * =================================================================== */
+
+static WINDOW *win_main, *win_info, *win_status, *win_input;
+
+/* ===================================================================
+ * 全局状态
+ * =================================================================== */
+
+static struct proc_info       g_procs[MAX_PROCS];
+static struct proc_tree_node  g_tree_nodes[MAX_PROCS];
+static struct proc_stat       g_stat;
+static int g_proc_count  = 0;
+static int g_tree_count  = 0;
+static int g_selected    = 0;
+static int g_scroll      = 0;
+static int g_running     = 1;
+
+/* 视图模式 */
+static int g_view_list   = 1;    /* 1=list, 0=tree */
+
+/* 排序 */
+static int  g_sort_field = 0;    /* 0=pid,1=cpu,2=mem,3=name */
+static int  g_sort_desc  = 0;
+
+/* 过滤 */
+static char g_filter[64] = "";
+static int  g_filter_active = 0;
+
+/* 命令缓冲区 */
+static char g_cmd[MAX_CMD_LEN];
+static int  g_cmd_pos = 0;
+
+/* 上次错误 */
+static char g_last_err[256] = "";
+
+/* ===================================================================
+ * 辅助函数
+ * =================================================================== */
+
+static const char *cstr(const char comm[16])
 {
-	int ret, count = 0;
+	static char buf[17];
+	int n;
+	for (n = 0; n < 16 && comm[n]; n++)
+		buf[n] = comm[n];
+	buf[n] = '\0';
+	return buf;
+}
+
+static char state_char(int state)
+{
+	switch (state) {
+	case 0:  return 'R';
+	case 1:  return 'S';
+	case 2:  return 'D';
+	case 4:  return 'T';
+	case 8:  return 't';
+	case 16: return 'Z';
+	case 32: return 'X';
+	default: return '?';
+	}
+}
+
+static const char *state_name(int state)
+{
+	switch (state) {
+	case 0:  return "RUNNING";
+	case 1:  return "SLEEPING";
+	case 2:  return "DISK_WAIT";
+	case 4:  return "STOPPED";
+	case 8:  return "TRACED";
+	case 16: return "ZOMBIE";
+	default: return "IDLE/OTHER";
+	}
+}
+
+static double cpu_sec(const struct proc_info *p)
+{
+	return (double)(p->utime + p->stime) / HZ;
+}
+
+static const char *fmt_size(unsigned long bytes)
+{
+	static char buf[16];
+	if (bytes >= 1UL << 30)
+		snprintf(buf, sizeof(buf), "%.1fG", (double)bytes / (1UL << 30));
+	else if (bytes >= 1UL << 20)
+		snprintf(buf, sizeof(buf), "%.1fM", (double)bytes / (1UL << 20));
+	else if (bytes >= 1UL << 10)
+		snprintf(buf, sizeof(buf), "%.1fK", (double)bytes / (1UL << 10));
+	else
+		snprintf(buf, sizeof(buf), "%luB", bytes);
+	return buf;
+}
+
+/* ===================================================================
+ * 系统调用层
+ * =================================================================== */
+
+static int fetch_procs(void)
+{
+	int count = 0;
+	long ret;
 	ret = syscall(SYS_proc_collect, g_procs, MAX_PROCS, &count);
 	if (ret < 0) {
-		perror("syscall(SYS_proc_collect)");
+		snprintf(g_last_err, sizeof(g_last_err),
+			 "proc_collect: %s", strerror(errno));
 		return -1;
 	}
 	g_proc_count = count;
 	return 0;
 }
 
-static int call_proc_snapshot(void)
+static int fetch_tree(void)
 {
-	int ret, count = 0;
-	ret = syscall(SYS_proc_snapshot, g_tree, MAX_PROCS, &count);
+	int count = 0;
+	long ret;
+	ret = syscall(SYS_proc_snapshot, g_tree_nodes, MAX_PROCS, &count);
 	if (ret < 0) {
-		perror("syscall(SYS_proc_snapshot)");
+		snprintf(g_last_err, sizeof(g_last_err),
+			 "proc_snapshot: %s", strerror(errno));
 		return -1;
 	}
 	g_tree_count = count;
 	return 0;
 }
 
-static int call_proc_stat(void)
+static int fetch_stat(void)
 {
-	int ret;
+	long ret;
 	ret = syscall(SYS_proc_stat, &g_stat);
 	if (ret < 0) {
-		perror("syscall(SYS_proc_stat)");
+		snprintf(g_last_err, sizeof(g_last_err),
+			 "proc_stat: %s", strerror(errno));
 		return -1;
 	}
 	return 0;
 }
 
-/* ===================================================================
- * 辅助函数
- * =================================================================== */
-
-/* 将内核状态码转为可读字符 */
-static char state_char(int state)
+static int update_data(void)
 {
-	switch (state) {
-	case 0:   return 'R';   /* TASK_RUNNING           */
-	case 1:   return 'S';   /* TASK_INTERRUPTIBLE     */
-	case 2:   return 'D';   /* TASK_UNINTERRUPTIBLE   */
-	case 4:   return 'T';   /* TASK_STOPPED           */
-	case 8:   return 't';   /* TASK_TRACED            */
-	case 16:  return 'Z';   /* EXIT_ZOMBIE            */
-	case 32:  return 'X';   /* EXIT_DEAD              */
-	case 1026:return 'I';   /* TASK_IDLE              */
-	default:  return '?';
-	}
-}
-
-/* 获取终端宽度 (用于自适应表格) */
-static int term_width(void)
-{
-	struct winsize w;
-	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0)
-		return w.ws_col;
-	return 80;
-}
-
-/* ===================================================================
- * 排序函数 (qsort 回调)
- * =================================================================== */
-
-static int cmp_pid_asc(const void *a, const void *b)
-{
-	const struct proc_info *pa = a, *pb = b;
-	return pa->pid - pb->pid;
-}
-static int cmp_pid_desc(const void *a, const void *b)
-{
-	return cmp_pid_asc(b, a);
-}
-
-static int cmp_cpu_asc(const void *a, const void *b)
-{
-	const struct proc_info *pa = a, *pb = b;
-	unsigned long ta = pa->utime + pa->stime;
-	unsigned long tb = pb->utime + pb->stime;
-	if (ta < tb) return -1;
-	if (ta > tb) return 1;
+	if (fetch_procs() < 0) return -1;
+	if (fetch_tree() < 0) return -1;
+	if (fetch_stat() < 0) return -1;
+	g_last_err[0] = '\0';
 	return 0;
 }
-static int cmp_cpu_desc(const void *a, const void *b)
-{
-	return cmp_cpu_asc(b, a);
-}
 
-static int cmp_mem_asc(const void *a, const void *b)
+/* ===================================================================
+ * 排序
+ * =================================================================== */
+
+static int cmp_pid(const void *a, const void *b)
 {
 	const struct proc_info *pa = a, *pb = b;
-	return pa->rss - pb->rss;
+	return (pa->pid > pb->pid) - (pa->pid < pb->pid);
 }
-static int cmp_mem_desc(const void *a, const void *b)
-{
-	return cmp_mem_asc(b, a);
-}
-
-static int cmp_name_asc(const void *a, const void *b)
+static int cmp_cpu(const void *a, const void *b)
 {
 	const struct proc_info *pa = a, *pb = b;
-	return strcmp(pa->comm, pb->comm);
+	unsigned long ca = pa->utime + pa->stime;
+	unsigned long cb = pb->utime + pb->stime;
+	return (ca > cb) - (ca < cb);
 }
-static int cmp_name_desc(const void *a, const void *b)
+static int cmp_mem(const void *a, const void *b)
 {
-	return cmp_name_asc(b, a);
+	const struct proc_info *pa = a, *pb = b;
+	return (pa->rss > pb->rss) - (pa->rss < pb->rss);
+}
+static int cmp_name(const void *a, const void *b)
+{
+	const struct proc_info *pa = a, *pb = b;
+	return strcmp(cstr(pa->comm), cstr(pb->comm));
 }
 
 static void sort_procs(void)
 {
-	typedef int (*cmp_t)(const void *, const void *);
-	static const cmp_t table[4][2] = {
-		{ cmp_pid_asc,  cmp_pid_desc  },
-		{ cmp_cpu_asc,  cmp_cpu_desc  },
-		{ cmp_mem_asc,  cmp_mem_desc  },
-		{ cmp_name_asc, cmp_name_desc },
-	};
+	int (*cmps[])(const void *, const void *) =
+		{ cmp_pid, cmp_cpu, cmp_mem, cmp_name };
+
 	qsort(g_procs, g_proc_count, sizeof(struct proc_info),
-	      table[g_sort_field][g_sort_desc]);
+	      cmps[g_sort_field]);
+
+	if (g_sort_desc) {
+		/* reverse in-place */
+		int i, j;
+		struct proc_info tmp;
+		for (i = 0, j = g_proc_count - 1; i < j; i++, j--) {
+			tmp = g_procs[i];
+			g_procs[i] = g_procs[j];
+			g_procs[j] = tmp;
+		}
+	}
 }
 
 /* ===================================================================
- * 过滤匹配
+ * 过滤
  * =================================================================== */
 
 static int match_filter(const struct proc_info *p)
 {
-	if (g_filter_pid > 0 && p->pid != g_filter_pid)
-		return 0;
-	if (g_filter_name[0] && !strstr(p->comm, g_filter_name))
-		return 0;
+	char text[64];
+	int i;
+
+	if (!g_filter_active || g_filter[0] == '\0')
+		return 1;
+
+	for (i = 0; g_filter[i]; i++)
+		text[i] = (char)(g_filter[i] >= 'A' && g_filter[i] <= 'Z'
+				 ? g_filter[i] + 32 : g_filter[i]);
+	text[i] = '\0';
+
+	/* =R, =Z, =S, ... : 按状态过滤 */
+	if (text[0] == '=' && text[1]) {
+		char want = (char)(text[1] >= 'a' ? text[1] - 32 : text[1]);
+		return state_char(p->state) == want;
+	}
+
+	/* :1234 : 按 PID 过滤 */
+	if (text[0] == ':') {
+		int pid = atoi(text + 1);
+		return p->pid == pid;
+	}
+
+	/* 默认: 进程名子串匹配 */
+	{
+		char name[17];
+		int j;
+		for (j = 0; j < 16 && p->comm[j]; j++)
+			name[j] = (char)(p->comm[j] >= 'A' && p->comm[j] <= 'Z'
+					 ? p->comm[j] + 32 : p->comm[j]);
+		name[j] = '\0';
+		return strstr(name, text) != NULL;
+	}
+}
+
+/* ===================================================================
+ * 进程树渲染辅助
+ * =================================================================== */
+
+/* 判断 nodes[i] 是否为其父节点的最后一个孩子 */
+static int tree_is_last(int i, int count)
+{
+	pid_t ppid = g_tree_nodes[i].ppid;
+	int j;
+	for (j = i + 1; j < count; j++) {
+		if (g_tree_nodes[j].ppid == ppid)
+			return 0;
+	}
 	return 1;
 }
 
-/* ===================================================================
- * 显示功能
- * =================================================================== */
-
-static void display_stat(void)
+/* 判断从 nodes[i] 回溯到 level 层的祖先是否还有后续兄弟 */
+static int tree_has_continuation(int i, int count, int target_level)
 {
-	call_proc_stat();
+	/* 找到 i 的位置处处于 target_level 的祖先 */
+	pid_t ancestor_pid = g_tree_nodes[i].pid;
+	int cur_level = g_tree_nodes[i].level;
+	int j;
 
-	printf("\n");
-	printf("╔══════════════════════════════════════════╗\n");
-	printf("║       系 统 进 程 统 计 摘 要           ║\n");
-	printf("╠══════════════════════════════════════════╣\n");
-	printf("║  进程总数:     %6d                    ║\n", g_stat.total_processes);
-	printf("║  运行中 (R):   %6d                    ║\n", g_stat.running_processes);
-	printf("║  可中断睡眠(S):%6d                    ║\n", g_stat.sleeping_processes);
-	printf("║  不可中断(D):  %6d                    ║\n", g_stat.uninterruptible);
-	printf("║  停止 (T):     %6d                    ║\n", g_stat.stopped_processes);
-	printf("║  僵尸 (Z):     %6d                    ║\n", g_stat.zombie_processes);
-	printf("║  空闲 (I):     %6d                    ║\n", g_stat.idle_processes);
-	printf("╠══════════════════════════════════════════╣\n");
-	printf("║  内核线程:     %6d                    ║\n", g_stat.kernel_threads);
-	printf("║  用户进程:     %6d                    ║\n", g_stat.user_threads);
-	printf("╚══════════════════════════════════════════╝\n");
-}
-
-static void display_procs(void)
-{
-	int i, shown = 0;
-
-	call_proc_collect();
-	sort_procs();
-
-	/* 表头 */
-	printf("\n");
-	printf("%-8s %-8s %-16s %c %-4s %-6s %-10s %-8s %s\n",
-	       "PID", "PPID", "NAME", 'S', "NICE", "NTHR",
-	       "VSIZE(KB)", "RSS(KB)", "UID");
-	printf("%.*s\n", term_width(),
-	       "------------------------------------------------------------"
-	       "------------------------------------------------------------");
-
-	/* 表体 */
-	for (i = 0; i < g_proc_count; i++) {
-		if (g_filter_active && !match_filter(&g_procs[i]))
-			continue;
-
-		printf("%-8d %-8d %-16.16s %c %-4d %-6d %-10lu %-8lu %d\n",
-		       g_procs[i].pid,
-		       g_procs[i].ppid,
-		       g_procs[i].comm,
-		       state_char(g_procs[i].state),
-		       g_procs[i].nice,
-		       g_procs[i].num_threads,
-		       g_procs[i].vsize / 1024,
-		       g_procs[i].rss * 4,         /* 页大小按 4KB 算 */
-		       g_procs[i].uid);
-		shown++;
+	/* 回溯找到 target_level 的祖先 */
+	while (cur_level > target_level) {
+		pid_t target_ppid = -1;
+		/* 找 ancestor_pid 在 nodes 中的位置 */
+		int found = 0;
+		for (j = 0; j < count; j++) {
+			if (g_tree_nodes[j].pid == ancestor_pid) {
+				ancestor_pid = g_tree_nodes[j].ppid;
+				cur_level = g_tree_nodes[j].level;
+				found = 1;
+				break;
+			}
+		}
+		if (!found) return 0;
 	}
 
-	/* 过滤状态提示 */
-	if (g_filter_active) {
-		printf("\n--- 过滤条件: ");
-		if (g_filter_pid > 0)
-			printf("PID=%d ", g_filter_pid);
-		if (g_filter_name[0])
-			printf("NAME~=%s", g_filter_name);
-		printf(" | 匹配: %d / 总数: %d ---\n", shown, g_proc_count);
+	/* 现在 ancestor_pid 处于 target_level, 检查其后是否有兄弟 */
+	for (j = i + 1; j < count; j++) {
+		/* 找 nodes[j] 的 target_level 祖先 */
+		pid_t aid = g_tree_nodes[j].pid;
+		int cl = g_tree_nodes[j].level;
+		while (cl > target_level) {
+			int found = 0;
+			int k;
+			for (k = 0; k < count; k++) {
+				if (g_tree_nodes[k].pid == aid) {
+					aid = g_tree_nodes[k].ppid;
+					cl = g_tree_nodes[k].level;
+					found = 1;
+					break;
+				}
+			}
+			if (!found) break;
+		}
+		if (cl == target_level && aid == ancestor_pid)
+			return 1;
+	}
+	return 0;
+}
+
+/* ===================================================================
+ * ncurses GUI
+ * =================================================================== */
+
+static void gui_init(void)
+{
+	int rows, cols;
+
+	initscr();
+	cbreak();
+	noecho();
+	curs_set(1);
+	keypad(stdscr, TRUE);
+
+	if (has_colors()) {
+		start_color();
+		init_pair(1, COLOR_GREEN,  COLOR_BLACK);  /* R state */
+		init_pair(2, COLOR_RED,    COLOR_BLACK);  /* Z state */
+		init_pair(3, COLOR_YELLOW, COLOR_BLACK);  /* D state */
+		init_pair(4, COLOR_CYAN,   COLOR_BLACK);  /* title */
+		init_pair(5, COLOR_WHITE,  COLOR_BLUE);   /* header */
+	}
+
+	getmaxyx(stdscr, rows, cols);
+
+	win_main   = newwin(rows - 5, cols, 0, 0);
+	win_info   = newwin(2, cols, rows - 5, 0);
+	win_status = newwin(1, cols, rows - 3, 0);
+	win_input  = newwin(1, cols, rows - 1, 0);
+
+	keypad(win_main, TRUE);
+	keypad(win_input, TRUE);
+	scrollok(win_main, FALSE);
+
+	/* 1 秒超时 → 自动刷新数据 */
+	wtimeout(win_input, 1000);
+}
+
+static void gui_cleanup(void)
+{
+	delwin(win_main);
+	delwin(win_info);
+	delwin(win_status);
+	delwin(win_input);
+	endwin();
+}
+
+static void gui_redraw(void)
+{
+	int i, row, max_rows, cols;
+	int shown, total;
+	const char *fields[] = { "PID", "CPU", "MEM", "NAME" };
+
+	getmaxyx(win_main, max_rows, cols);
+	(void)cols;
+
+	/* ---- win_main: 进程列表 / 树 ---- */
+	wclear(win_main);
+	box(win_main, 0, 0);
+
+	if (g_view_list) {
+		/* 表头 */
+		wattron(win_main, COLOR_PAIR(5));
+		mvwprintw(win_main, 0, 2, " ProcMon ");
+		wattroff(win_main, COLOR_PAIR(5));
+		mvwprintw(win_main, 0, 12, "| Sort:%s %s | %s",
+			  (const char *[]){"PID","CPU","MEM","NAME"}[g_sort_field],
+			  g_sort_desc ? "desc" : "asc",
+			  g_filter_active ? "FILTER=ON" : "");
+
+		mvwprintw(win_main, 2, 2,
+			  "%-7s %-7s %-18s %c %-4s %-6s %-8s %-8s %-8s %s",
+			  "PID", "PPID", "NAME", 'S', "NICE", "THR",
+			  "VSIZE", "RSS", "CPU(s)", "UID");
+
+		/* 分隔线 */
+		mvwhline(win_main, 3, 1, ACS_HLINE, cols - 2);
+
+		/* 数据行 */
+		shown = 0; total = 0;
+		for (i = 0; i < g_proc_count; i++) {
+			if (!match_filter(&g_procs[i]))
+				continue;
+			total++;
+		}
+
+		if (g_selected >= total) g_selected = total - 1;
+		if (g_selected < 0) g_selected = 0;
+
+		/* 滚动 clamp */
+		if (g_selected < g_scroll)
+			g_scroll = g_selected;
+		if (g_selected >= g_scroll + (max_rows - 5))
+			g_scroll = g_selected - (max_rows - 5) + 1;
+		if (g_scroll < 0) g_scroll = 0;
+
+		shown = 0;
+		for (i = 0, row = 4; i < g_proc_count && row < max_rows - 1; i++) {
+			const struct proc_info *p = &g_procs[i];
+			char st;
+			int color_pair;
+
+			if (!match_filter(p))
+				continue;
+			if (shown < g_scroll) {
+				shown++;
+				continue;
+			}
+
+			st = state_char(p->state);
+
+			/* 高亮选中行 */
+			if (shown == g_selected)
+				wattron(win_main, A_REVERSE);
+
+			/* 按状态着色 */
+			switch (st) {
+			case 'R': color_pair = 1; break;
+			case 'Z': color_pair = 2; break;
+			case 'D': color_pair = 3; break;
+			default:  color_pair = 0; break;
+			}
+			if (color_pair && shown != g_selected)
+				wattron(win_main, COLOR_PAIR(color_pair));
+
+			mvwprintw(win_main, row, 2,
+				  "%-7d %-7d %-18.18s %c %-4d %-6d "
+				  "%-8s %-8s %-8.1f %d",
+				  p->pid, p->ppid, cstr(p->comm), st,
+				  p->nice, p->num_threads,
+				  fmt_size(p->vsize),
+				  fmt_size(p->rss * 4096),
+				  cpu_sec(p), p->uid);
+
+			if (color_pair && shown != g_selected)
+				wattroff(win_main, COLOR_PAIR(color_pair));
+			if (shown == g_selected)
+				wattroff(win_main, A_REVERSE);
+
+			shown++;
+			row++;
+		}
+
 	} else {
-		printf("\n--- 总数: %d ---\n", g_proc_count);
-	}
-}
+		/* 进程树视图 */
+		wattron(win_main, COLOR_PAIR(5));
+		mvwprintw(win_main, 0, 2, " Process Tree ");
+		wattroff(win_main, COLOR_PAIR(5));
+		mvwprintw(win_main, 0, 18, "| %d nodes", g_tree_count);
 
-static void export_process_tree(const char *filename)
-{
-	FILE *fp;
-	int i;
+		mvwhline(win_main, 1, 1, ACS_HLINE, cols - 2);
 
-	call_proc_snapshot();
+		if (g_selected >= g_tree_count) g_selected = g_tree_count - 1;
+		if (g_selected < 0) g_selected = 0;
 
-	fp = fopen(filename, "w");
-	if (!fp) {
-		perror("fopen");
-		return;
-	}
+		if (g_selected < g_scroll)
+			g_scroll = g_selected;
+		if (g_selected >= g_scroll + (max_rows - 3))
+			g_scroll = g_selected - (max_rows - 3) + 1;
+		if (g_scroll < 0) g_scroll = 0;
 
-	/* 输出 Graphviz DOT 格式 */
-	fprintf(fp, "// 进程树 — 由 proc_monitor 生成\n");
-	fprintf(fp, "// 渲染: dot -Tpng %s -o tree.png\n", filename);
-	fprintf(fp, "digraph proc_tree {\n");
-	fprintf(fp, "  rankdir = TB;\n");
-	fprintf(fp, "  node [shape=box, style=filled, fillcolor=\"#fffde7\", "
-		     "fontname=\"monospace\", fontsize=10];\n");
-	fprintf(fp, "  edge [color=\"#546e7a\", arrowhead=normal];\n\n");
+		shown = 0;
+		for (i = 0, row = 2; i < g_tree_count && row < max_rows - 1; i++) {
+			int level = g_tree_nodes[i].level;
+			int last  = tree_is_last(i, g_tree_count);
+			char prefix[128] = "";
+			int lev;
 
-	for (i = 0; i < g_tree_count; i++) {
-		/* 按状态着色 */
-		fprintf(fp,
-			"  p%d [label=\"%s\\nPID=%d\"];\n",
-			g_tree[i].pid, g_tree[i].comm, g_tree[i].pid);
+			if (shown < g_scroll) { shown++; continue; }
 
-		/* 连线 (跳过 init 自身的父进程) */
-		if (g_tree[i].ppid != 0 && g_tree[i].pid != 1) {
-			fprintf(fp, "  p%d -> p%d;\n",
-				g_tree[i].ppid, g_tree[i].pid);
+			/* 构建缩进前缀 */
+			for (lev = 0; lev < level; lev++) {
+				if (tree_has_continuation(i, g_tree_count, lev))
+					strcat(prefix, "│   ");
+				else
+					strcat(prefix, "    ");
+			}
+			strcat(prefix, last ? "└── " : "├── ");
+
+			if (shown == g_selected)
+				wattron(win_main, A_REVERSE);
+			wattron(win_main, COLOR_PAIR(4));
+			mvwprintw(win_main, row, 2, "%s%s(%d)",
+				  prefix, cstr(g_tree_nodes[i].comm),
+				  g_tree_nodes[i].pid);
+			wattroff(win_main, COLOR_PAIR(4));
+			if (shown == g_selected)
+				wattroff(win_main, A_REVERSE);
+
+			shown++;
+			row++;
 		}
 	}
 
-	fprintf(fp, "}\n");
-	fclose(fp);
+	wrefresh(win_main);
 
-	printf("进程树已导出到: %s (%d 个节点)\n", filename, g_tree_count);
-	printf("渲染命令: dot -Tpng %s -o tree.png\n", filename);
+	/* ---- win_info: 选中项详情 / 统计 ---- */
+	wclear(win_info);
+	box(win_info, 0, 0);
+	wattron(win_info, COLOR_PAIR(4));
+	mvwprintw(win_info, 0, 2, "Info");
+	wattroff(win_info, COLOR_PAIR(4));
+
+	if (g_view_list) {
+		int sel_idx = -1, cnt = 0;
+		for (i = 0; i < g_proc_count; i++) {
+			if (!match_filter(&g_procs[i])) continue;
+			if (cnt == g_selected) { sel_idx = i; break; }
+			cnt++;
+		}
+		if (sel_idx >= 0) {
+			const struct proc_info *p = &g_procs[sel_idx];
+			mvwprintw(win_info, 0, 8,
+				  "PID=%-6d PPID=%-6d STATE=%s(%c)  "
+				  "NICE=%-4d THREADS=%-4d UID=%d",
+				  p->pid, p->ppid,
+				  state_name(p->state),
+				  state_char(p->state),
+				  p->nice, p->num_threads, p->uid);
+			mvwprintw(win_info, 1, 2,
+				  "VSIZE=%s  RSS=%s  CPU=%.1fs  "
+				  "utime=%lu  stime=%lu",
+				  fmt_size(p->vsize),
+				  fmt_size(p->rss * 4096),
+				  cpu_sec(p), p->utime, p->stime);
+		}
+	} else {
+		if (g_selected < g_tree_count) {
+			mvwprintw(win_info, 0, 8,
+				  "PID=%-6d PPID=%-6d LEVEL=%d  NAME=%s",
+				  g_tree_nodes[g_selected].pid,
+				  g_tree_nodes[g_selected].ppid,
+				  g_tree_nodes[g_selected].level,
+				  cstr(g_tree_nodes[g_selected].comm));
+		}
+	}
+
+	wrefresh(win_info);
+
+	/* ---- win_status: 状态栏 ---- */
+	wclear(win_status);
+	wattron(win_status, COLOR_PAIR(5));
+	mvwprintw(win_status, 0, 0,
+		  " T:%d R:%d S:%d D:%d Z:%d T:%d | Kthr:%d Uthr:%d | "
+		  "%d/%d | %s: %s %s ",
+		  g_stat.total_processes,
+		  g_stat.running_processes,
+		  g_stat.sleeping_processes,
+		  g_stat.uninterruptible,
+		  g_stat.zombie_processes,
+		  g_stat.stopped_processes,
+		  g_stat.kernel_threads,
+		  g_stat.user_threads,
+		  g_selected,
+		  g_view_list ? g_proc_count : g_tree_count,
+		  g_view_list ? "LIST" : "TREE",
+		  fields[g_sort_field],
+		  g_sort_desc ? "▼" : "▲");
+	wattroff(win_status, COLOR_PAIR(5));
+
+	if (g_last_err[0] && g_last_err[0] != 'O') {
+		wattron(win_status, COLOR_PAIR(2));
+		mvwprintw(win_status, 0, cols - 40, " %s ", g_last_err);
+		wattroff(win_status, COLOR_PAIR(2));
+	}
+	wrefresh(win_status);
+
+	/* ---- win_input ---- */
+	wclear(win_input);
+	mvwprintw(win_input, 0, 0, "> %s", g_cmd);
+	wrefresh(win_input);
 }
 
 /* ===================================================================
- * 实时刷新模式
+ * 命令处理
  * =================================================================== */
 
-static void sigint_handler(int sig)
+static void exec_command(const char *cmd)
 {
-	(void)sig;
-	g_running = 0;
-}
+	char copy[MAX_CMD_LEN];
+	char *args[8];
+	int argc = 0;
+	char *token, *save;
 
-static void live_mode(void)
-{
-	struct sigaction sa_old, sa_new;
+	strncpy(copy, cmd, MAX_CMD_LEN - 1);
+	copy[MAX_CMD_LEN - 1] = '\0';
 
-	printf("进入实时刷新模式 (按 Ctrl+C 返回交互模式)...\n");
-	sleep(1);
-
-	/* 设置临时 SIGINT 处理器 */
-	sa_new.sa_handler = sigint_handler;
-	sigemptyset(&sa_new.sa_mask);
-	sa_new.sa_flags = 0;
-	sigaction(SIGINT, &sa_new, &sa_old);
-
-	g_running = 1;
-	while (g_running) {
-		printf("\033[2J\033[H");       /* 清屏 + 光标归位 */
-		display_stat();
-		display_procs();
-		printf("\n刷新间隔: %ds | Ctrl+C 返回\n", REFRESH_SEC);
-		fflush(stdout);
-		sleep(REFRESH_SEC);
+	token = strtok_r(copy, " \t", &save);
+	while (token && argc < 8) {
+		args[argc++] = token;
+		token = strtok_r(NULL, " \t", &save);
 	}
 
-	/* 恢复默认 SIGINT */
-	sigaction(SIGINT, &sa_old, NULL);
-	g_running = 1;
-}
+	if (argc == 0) return;
 
-/* ===================================================================
- * 交互命令处理
- * =================================================================== */
-
-static void show_help(void)
-{
-	printf("\n");
-	printf("╔══════════════════════════════════════════════════════╗\n");
-	printf("║    Linux 进程全量监控与分析系统 — 命令列表        ║\n");
-	printf("╠══════════════════════════════════════════════════════╣\n");
-	printf("║  stat               查看系统进程统计摘要           ║\n");
-	printf("║  list               显示进程列表 (含排序/过滤)     ║\n");
-	printf("║  tree [文件名]      导出进程树 (DOT 格式)          ║\n");
-	printf("║  watch              实时刷新模式                   ║\n");
-	printf("║  sort pid|cpu|mem|name  设置排序字段               ║\n");
-	printf("║  order              切换升序/降序                  ║\n");
-	printf("║  filter pid=N       按 PID 过滤                    ║\n");
-	printf("║  filter name=XXX    按进程名过滤 (子串匹配)        ║\n");
-	printf("║  filter off         关闭过滤                       ║\n");
-	printf("║  help               显示此帮助                     ║\n");
-	printf("║  quit               退出程序                       ║\n");
-	printf("╚══════════════════════════════════════════════════════╝\n");
-}
-
-static void handle_command(char *cmd)
-{
-	char *arg = strchr(cmd, ' ');
-	if (arg) {
-		*arg = '\0';
-		arg++;
-		/* 跳过前导空白 */
-		while (*arg == ' ' || *arg == '\t') arg++;
-	}
-
-	if (strcmp(cmd, "help") == 0 || strcmp(cmd, "h") == 0) {
-		show_help();
-
-	} else if (strcmp(cmd, "list") == 0 || strcmp(cmd, "l") == 0) {
-		display_procs();
-
-	} else if (strcmp(cmd, "stat") == 0 || strcmp(cmd, "s") == 0) {
-		display_stat();
-
-	} else if (strcmp(cmd, "tree") == 0 || strcmp(cmd, "t") == 0) {
-		export_process_tree(arg ? arg : "proc_tree.dot");
-
-	} else if (strcmp(cmd, "watch") == 0 || strcmp(cmd, "w") == 0) {
-		live_mode();
-
-	} else if (strcmp(cmd, "sort") == 0) {
-		if (!arg) {
-			printf("用法: sort pid|cpu|mem|name\n");
-		} else if (strcmp(arg, "pid") == 0)  g_sort_field = 0;
-		else if (strcmp(arg, "cpu") == 0)   g_sort_field = 1;
-		else if (strcmp(arg, "mem") == 0)   g_sort_field = 2;
-		else if (strcmp(arg, "name") == 0)  g_sort_field = 3;
-		else printf("未知排序字段: %s\n", arg);
-		printf("排序: %s (%s)\n",
-		       (const char *[]){"PID","CPU","MEM","NAME"}[g_sort_field],
-		       g_sort_desc ? "降序" : "升序");
-
-	} else if (strcmp(cmd, "order") == 0) {
-		g_sort_desc = !g_sort_desc;
-		printf("排序方向: %s\n", g_sort_desc ? "降序" : "升序");
-
-	} else if (strcmp(cmd, "filter") == 0) {
-		if (!arg || strcmp(arg, "off") == 0) {
+	if (strcmp(args[0], "sort") == 0 && argc >= 2) {
+		if (strcmp(args[1], "pid") == 0)  g_sort_field = 0;
+		else if (strcmp(args[1], "cpu") == 0) g_sort_field = 1;
+		else if (strcmp(args[1], "mem") == 0) g_sort_field = 2;
+		else if (strcmp(args[1], "name") == 0) g_sort_field = 3;
+		sort_procs();
+		g_selected = 0;
+		g_scroll = 0;
+	} else if (strcmp(args[0], "filter") == 0) {
+		if (argc < 2 || strcmp(args[1], "off") == 0) {
+			g_filter[0] = '\0';
 			g_filter_active = 0;
-			g_filter_pid = 0;
-			g_filter_name[0] = '\0';
-			printf("过滤已关闭\n");
-		} else if (strncmp(arg, "pid=", 4) == 0) {
-			g_filter_pid = (pid_t)atoi(arg + 4);
-			g_filter_active = 1;
-			printf("过滤: PID = %d\n", g_filter_pid);
-		} else if (strncmp(arg, "name=", 5) == 0) {
-			strncpy(g_filter_name, arg + 5,
-				sizeof(g_filter_name) - 1);
-			g_filter_name[sizeof(g_filter_name) - 1] = '\0';
-			g_filter_active = 1;
-			printf("过滤: NAME ~= \"%s\"\n", g_filter_name);
 		} else {
-			printf("用法: filter pid=N | filter name=XXX | filter off\n");
+			/* 拼接空格分隔的过滤参数 */
+			int pos = 0, k;
+			for (k = 1; k < argc && pos < (int)sizeof(g_filter) - 1; k++) {
+				if (k > 1) g_filter[pos++] = ' ';
+				strncpy(g_filter + pos, args[k],
+					sizeof(g_filter) - pos - 1);
+				pos += (int)strlen(args[k]);
+			}
+			g_filter[pos] = '\0';
+			g_filter_active = 1;
 		}
-
-	} else if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0) {
+		g_selected = 0;
+		g_scroll = 0;
+	} else if (strcmp(args[0], "tree") == 0) {
+		g_view_list = 0;
+		g_selected = 0;
+		g_scroll = 0;
+	} else if (strcmp(args[0], "list") == 0) {
+		g_view_list = 1;
+		g_selected = 0;
+		g_scroll = 0;
+	} else if (strcmp(args[0], "help") == 0 || strcmp(args[0], "h") == 0) {
+		def_prog_mode();
+		endwin();
+		printf("\n======== Process Monitor Help ========\n");
+		printf("  sort pid|cpu|mem|name   Set sort field\n");
+		printf("  filter <text>           Filter by name substring\n");
+		printf("  filter =R               Filter by state (R/S/D/T/Z)\n");
+		printf("  filter :1234            Filter by PID\n");
+		printf("  filter off              Clear filter\n");
+		printf("  tree / list             Switch view mode\n");
+		printf("  help                    Show this help\n");
+		printf("  q / quit / ESC          Exit\n");
+		printf("\nKeys: ↑↓ select | Tab change sort | "
+		       "s toggle asc/desc\n");
+		printf("      t toggle tree/list | r clear filter\n");
+		printf("=======================================\n");
+		printf("Press Enter to continue...");
+		getchar();
+		reset_prog_mode();
+		refresh();
+	} else if (strcmp(args[0], "q") == 0 ||
+		   strcmp(args[0], "quit") == 0) {
 		g_running = 0;
-
-	} else if (cmd[0] != '\0') {
-		printf("未知命令: '%s' (输入 help 查看帮助)\n", cmd);
+	} else {
+		snprintf(g_last_err, sizeof(g_last_err),
+			 "Unknown: %s (try 'help')", args[0]);
 	}
 }
 
 /* ===================================================================
- * 主函数
+ * 主循环
  * =================================================================== */
 
 int main(void)
 {
-	char line[512];
+	int ch;
 
-	printf("\n");
-	printf("╔══════════════════════════════════════════╗\n");
-	printf("║   Linux 进程全量监控与分析系统         ║\n");
-	printf("║   基于自定义系统调用 (syscall 462-464) ║\n");
-	printf("╚══════════════════════════════════════════╝\n");
-	printf("\n输入 'help' 查看命令列表, 'quit' 退出\n");
+	gui_init();
 
-	/* 启动时展示统计概览 */
-	display_stat();
+	/* 首次加载数据 */
+	if (update_data() < 0) {
+		gui_cleanup();
+		fprintf(stderr, "Failed to fetch data. "
+			"Are the custom syscalls (470-472) installed?\n"
+			"Try: sudo ./proc_monitor\n");
+		return 1;
+	}
+	sort_procs();
 
 	while (g_running) {
-		printf("\nprocmon> ");
-		fflush(stdout);
+		gui_redraw();
 
-		if (!fgets(line, sizeof(line), stdin))
-			break;
+		ch = wgetch(win_input);
 
-		/* 去除末尾换行 */
-		line[strcspn(line, "\n")] = '\0';
-
-		if (line[0] == '\0')
+		if (ch == ERR) {
+			/* timeout → 刷新数据 */
+			update_data();
+			sort_procs();
 			continue;
+		}
 
-		handle_command(line);
+		if (ch == KEY_UP || ch == 'k') {
+			if (g_selected > 0) g_selected--;
+		} else if (ch == KEY_DOWN || ch == 'j') {
+			g_selected++;
+		} else if (ch == KEY_PPAGE) {
+			g_selected -= 20;
+			if (g_selected < 0) g_selected = 0;
+		} else if (ch == KEY_NPAGE) {
+			g_selected += 20;
+		} else if (ch == '\t') {
+			/* Tab: 切换排序字段 */
+			g_sort_field = (g_sort_field + 1) % 4;
+			sort_procs();
+			g_selected = 0;
+			g_scroll = 0;
+		} else if (ch == 's') {
+			/* s: 切换升降序 */
+			g_sort_desc = !g_sort_desc;
+			sort_procs();
+		} else if (ch == 't') {
+			/* t: 切换列表/树 */
+			g_view_list = !g_view_list;
+			g_selected = 0;
+			g_scroll = 0;
+		} else if (ch == 'r') {
+			/* r: 清除过滤 */
+			g_filter[0] = '\0';
+			g_filter_active = 0;
+			g_selected = 0;
+			g_scroll = 0;
+		} else if (ch == '/') {
+			/* /: 输入过滤文本 */
+			g_cmd_pos = 0;
+			g_cmd[0] = '\0';
+			mvwprintw(win_input, 0, 0, "filter ");
+			wrefresh(win_input);
+			echo();
+			curs_set(1);
+			wgetnstr(win_input, g_cmd, MAX_CMD_LEN - 1);
+			noecho();
+			curs_set(0);
+			if (g_cmd[0]) {
+				char full_cmd[MAX_CMD_LEN + 10];
+				snprintf(full_cmd, sizeof(full_cmd),
+					 "filter %s", g_cmd);
+				exec_command(full_cmd);
+			}
+			g_cmd[0] = '\0';
+			g_cmd_pos = 0;
+		} else if (ch == '\n' || ch == KEY_ENTER) {
+			if (g_cmd_pos > 0) {
+				g_cmd[g_cmd_pos] = '\0';
+				exec_command(g_cmd);
+				g_cmd_pos = 0;
+				g_cmd[0] = '\0';
+			}
+		} else if (ch == 27 || ch == 'q') {
+			/* ESC / q → 退出 */
+			g_running = 0;
+		} else if (ch == KEY_BACKSPACE || ch == 127) {
+			if (g_cmd_pos > 0)
+				g_cmd[--g_cmd_pos] = '\0';
+		} else if (ch >= 32 && ch <= 126 &&
+			   g_cmd_pos < MAX_CMD_LEN - 1) {
+			g_cmd[g_cmd_pos++] = (char)ch;
+		}
 	}
 
-	printf("\n再见!\n");
+	gui_cleanup();
 	return 0;
 }

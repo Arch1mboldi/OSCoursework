@@ -8,7 +8,7 @@
 
 CC      = gcc
 CFLAGS  = -Wall -Wextra -O2 -std=c11
-LDFLAGS =
+LDFLAGS = -lncurses
 
 TARGET  = proc_monitor
 TEST    = test_syscall
