@@ -155,6 +155,116 @@ sudo ./procmon
 
 ---
 
+## 实现依据：Linux 内核文档与 API 参考
+
+本节记录每个内核接口、数据结构、同步机制在 Linux 6.18 官方文档中的出处。
+
+### 1. 系统调用注册机制
+
+依据：**`Documentation/process/adding-syscalls.rst`**
+
+| 实现要点 | 内核文档要求 | 对应代码 |
+|:---|:---|:---|
+| 使用 `SYSCALL_DEFINEn()` 宏 | L200-204: *"add this entry point with the appropriate `SYSCALL_DEFINEn()` macro"* | `kernel/proc_monitor.c` L48/168/223 |
+| x86_64 系统调用表注册 | L300-309: *"a 'common' entry in `syscall_64.tbl`: `333 common xyzzy sys_xyzzy`"* | `syscall_64.tbl.patch` |
+| 在 `include/linux/syscalls.h` 添加原型 | L207-211: *"a corresponding function prototype, marked as asmlinkage"* | 待补充 |
+| 在 `kernel/sys_ni.c` 添加回退桩 | L225-229: *"Add your new system call here too: `COND_SYSCALL(xyzzy);`"* | 待补充 |
+| 设计可扩展的数据结构 | L83-103: 推荐用结构体封装参数，含 `size` 字段支持未来扩展 | `proc_info` 等结构体经 `copy_to_user()` 传递 |
+
+### 2. 进程链表遍历与 RCU 同步
+
+依据：**`Documentation/RCU/listRCU.rst`**
+
+| 实现要点 | 内核文档 | 对应代码 |
+|:---|:---|:---|
+| `for_each_process()` 基于 RCU 链表 | L29-36: `next_task(p)` → `list_entry_rcu(p->tasks.next, ...)` | `kernel/proc_monitor.c` L63/182/236 |
+| 读者应使用 `rcu_read_lock()` | L40-44: `rcu_read_lock(); for_each_process(p) { ... } rcu_read_unlock();` | 当前使用 `read_lock(&tasklist_lock)`，待优化 |
+| 写者使用 `write_lock(&tasklist_lock)` | L51-53: `write_lock(&tasklist_lock); list_del_rcu(...);` | 内核进程创建/销毁时自动处理 |
+| RCU 宽限期保证遍历安全 | L53-68: *"deferring of destruction ensures that any readers ... will see valid pointers"* | 保证遍历中读取的 `task_struct*` 字段有效 |
+| RCU 读者不可睡眠 | `Documentation/RCU/rcu.rst` L32-34: *"RCU readers are not permitted to block, switch to user-mode, or enter the idle loop"* | 因此 `copy_to_user()` 必须在释放锁之后调用 |
+
+### 3. 进程状态编码
+
+依据：**`include/linux/sched.h`**（内核头文件，Linux 6.x）
+
+Linux 5.14+ 将 `task_struct` 的 `state` 重命名为 **`__state`**，并引入 `TASK_REPORT` 掩码。
+退出状态（`EXIT_ZOMBIE`、`EXIT_DEAD`）存于独立的 **`task->exit_state`** 字段，不在 `__state` 中。
+
+| 字段 | 含义 | 典型值 |
+|:---|:---|:---|
+| `task->__state` | 当前调度状态 | `TASK_RUNNING=0`, `TASK_INTERRUPTIBLE=1`, `TASK_UNINTERRUPTIBLE=2`, `TASK_STOPPED`, `TASK_TRACED` |
+| `task->exit_state` | 进程退出状态 | `EXIT_ZOMBIE=0x10`, `EXIT_DEAD=0x20` |
+
+> **注意**：当前 `sys_proc_stat` 在 `switch(task->__state)` 中检测 `EXIT_ZOMBIE`/`EXIT_DEAD`，
+> 这两个值实际在 `exit_state` 中，`__state` 永远不包含它们。需修复（见审查报告 Issue 1）。
+
+### 4. CPU 时间采集
+
+依据：**`include/linux/sched/cputime.h`** + `include/linux/jiffies.h`
+
+发行版内核（`CONFIG_VIRT_CPU_ACCOUNTING_GEN=y`）将 CPU 时间以**纳秒**精度存储在 `task_struct` 中。
+直接读 `task->utime` 会得到纳秒值（如 56280000000），而非 jiffies。
+
+| API | 说明 | 代码位置 |
+|:---|:---|:---|
+| `task_cputime(task, &ut_ns, &st_ns)` | 以纳秒精度读取 CPU 时间 | `proc_monitor.c` L83-84 |
+| `nsec_to_clock_t(ns)` | 纳秒 → `USER_HZ` 时钟滴答（= `sysconf(_SC_CLK_TCK)`） | `proc_monitor.c` L85-86 |
+
+依据：**`Documentation/filesystems/proc.rst`** Table 1-4（L338-339）：
+> *"utime — user mode jiffies; stime — kernel mode jiffies"*
+
+本实现输出的 `utime` / `stime` 是 **USER_HZ 时钟滴答（jiffies）**，与 `/proc/pid/stat` 语义一致。
+
+### 5. 内存信息采集
+
+依据：**`Documentation/filesystems/proc.rst`** Table 1-4（L347-348）：
+> *"vsize — virtual memory size; rss — resident set memory size"*
+
+| API | 说明 | 代码位置 |
+|:---|:---|:---|
+| `task->mm->total_vm << PAGE_SHIFT` | 虚拟内存大小（页数 → 字节） | `proc_monitor.c` L91 |
+| `get_mm_rss(task->mm)` | 常驻内存集，返回页数 | `proc_monitor.c` L92 |
+
+依据：**`Documentation/mm/active_mm.rst`**（L44-46）：
+> *"tsk->mm points to the 'real address space'. For an anonymous process, tsk->mm will be NULL."*
+
+内核线程（`[kthreadd]`、`[ksoftirqd]` 等）`mm == NULL`，无用户态地址空间，`vsize`/`rss` 填 0。
+
+### 6. 用户身份映射
+
+| API | 说明 | 文档来源 |
+|:---|:---|:---|
+| `get_task_comm(kinfo.comm, task)` | 安全复制进程名（最多 `TASK_COMM_LEN-1` 字符） | `include/linux/sched.h` |
+| `task_tgid_nr(task)` | 获取线程组 ID，即用户态视角的 PID | `include/linux/sched.h` |
+| `task_nice(task)` | 获取 nice 优先级（-20 ~ 19） | `include/linux/sched.h` |
+| `from_kuid_munged(current_user_ns(), task_uid(task))` | 将内核 UID 映射到调用者的用户命名空间 | `include/linux/cred.h` |
+| `copy_to_user()` | 内核→用户态数据传递的唯一安全方式 | `adding-syscalls.rst` 隐含要求：所有 `__user` 指针必须经此函数 |
+
+### 7. 安全与权限
+
+依据：**`Documentation/process/adding-syscalls.rst`** L166-167：
+> *"If your new syscall manipulates a process other than the calling process, it should be restricted (using a call to `ptrace_may_access()`)"*
+
+当前实现无权限检查，任何用户可查看全部进程信息。若需限制访问，应添加 `capable(CAP_SYS_PTRACE)` 或 `ptrace_may_access()`。
+
+### 8. 头文件依赖对照表
+
+`kernel/proc_monitor.c` 的 `#include` 及各自提供的 API：
+
+| 头文件 | 提供的 API |
+|:---|:---|
+| `<linux/syscalls.h>` | `SYSCALL_DEFINEn()` 宏 |
+| `<linux/sched.h>` | `task_struct`, `for_each_process()`, `get_task_comm()`, `task_tgid_nr()`, `task_nice()` |
+| `<linux/sched/signal.h>` | `task->signal->nr_threads` |
+| `<linux/sched/cputime.h>` | `task_cputime()` |
+| `<linux/jiffies.h>` | `nsec_to_clock_t()` |
+| `<linux/uaccess.h>` | `copy_to_user()` |
+| `<linux/cred.h>` | `from_kuid_munged()`, `current_user_ns()`, `task_uid()` |
+| `<linux/mm.h>` | `get_mm_rss()`, `PAGE_SHIFT` |
+| `<linux/proc_monitor.h>` | 本项目自定义的共享数据结构 |
+
+---
+
 ## 核心设计决策
 
 ### 为什么设计专门的数据结构？
@@ -181,13 +291,15 @@ sudo ./procmon
 
 ## 技术要点
 
-| 要点 | 说明 |
-|:---|:---|
-| 锁机制 | `read_lock(&tasklist_lock)` 保护进程链表遍历 |
-| 锁释放时机 | `copy_to_user()` 可能睡眠，必须在释放锁后调用 |
-| 内核线程处理 | `mm==NULL` 的内核线程无用户态内存，vsize/rss 填 0 |
-| 状态编码 | Linux 6.x 使用 `task->__state`，编码值与旧版 `state` 不同 |
-| 逐个拷贝 | 每个条目单独 `copy_to_user()`，避免内核栈分配过大数组 |
+| 要点 | 说明 | 文档依据 |
+|:---|:---|:---|
+| 锁机制 | `read_lock(&tasklist_lock)` 保护进程链表遍历 | `RCU/listRCU.rst` — 推荐 `rcu_read_lock()` |
+| 锁释放时机 | `copy_to_user()` 可能睡眠，必须在释放锁后调用 | `RCU/rcu.rst` — RCU 读者不可阻塞 |
+| 内核线程处理 | `mm==NULL` 的内核线程无用户态内存，vsize/rss 填 0 | `mm/active_mm.rst` L44-46 |
+| 状态编码 | Linux 6.x 使用 `task->__state`；`exit_state` 存退出状态（僵尸/死） | `include/linux/sched.h` |
+| 逐个拷贝 | 每个条目单独 `copy_to_user()`，避免内核栈分配过大数组 | `adding-syscalls.rst` 安全要求 |
+| CPU 时间 | `task_cputime()` + `nsec_to_clock_t()` → USER_HZ 滴答 | `sched/cputime.h` + `proc.rst` L338-339 |
+| 内存信息 | `total_vm << PAGE_SHIFT` (字节) + `get_mm_rss()` (页数) | `proc.rst` L347-348 |
 
 ---
 
@@ -196,6 +308,16 @@ sudo ./procmon
 - [Linux Kernel 6.18](https://kernel.org/)
 - [Linux 内核源码在线](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git)
 - 详细设计文档: 参见仓库同级的 `plan.md`
+
+### 本项目引用的内核文档
+
+| 文档 | 路径 | 内容 |
+|:---|:---|:---|
+| 添加系统调用规范 | `Documentation/process/adding-syscalls.rst` | `SYSCALL_DEFINEn`, syscall 表注册, `copy_to_user`, 原型声明, `COND_SYSCALL` |
+| RCU 链表遍历 | `Documentation/RCU/listRCU.rst` | `for_each_process()`, `rcu_read_lock`, RCU 宽限期, 进程链表 |
+| RCU 基本概念 | `Documentation/RCU/rcu.rst` | RCU 读者不可阻塞/切换上下文/进入空闲 |
+| /proc 文件系统 | `Documentation/filesystems/proc.rst` | `/proc/pid/stat` 字段定义 (utime/stime/vsize/rss/nice/num_threads) |
+| Active MM | `Documentation/mm/active_mm.rst` | `task->mm == NULL` 内核线程语义 |
 
 ---
 
