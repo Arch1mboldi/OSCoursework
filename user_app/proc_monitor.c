@@ -155,7 +155,11 @@ struct prev_cpu {
 };
 static struct prev_cpu g_prev[MAX_PROCS];
 static int             g_prev_count = 0;
-static struct timeval  g_last_tv;
+
+/* 数据采集时间戳: g_tv_prev=上一帧采集时间, g_tv_curr=当前帧采集时间
+ * elapsed = g_tv_curr - g_tv_prev, 在 cpu_pct() 中用于计算 CPU% */
+static struct timeval  g_tv_prev, g_tv_curr;
+static int             g_has_prev = 0;  /* 是否已有上一帧数据 */
 
 /* 系统调用耗时记录 */
 static struct sc_result g_sc_collect;
@@ -283,7 +287,7 @@ static double cpu_pct(pid_t pid, unsigned long cur_total)
 	unsigned long prev_total;
 	double elapsed;
 
-	if (g_prev_count <= 0)
+	if (!g_has_prev || g_prev_count <= 0)
 		return 0.0;
 
 	found = bsearch(&key, g_prev, g_prev_count,
@@ -295,12 +299,10 @@ static double cpu_pct(pid_t pid, unsigned long cur_total)
 	if (cur_total < prev_total)
 		return 0.0;
 
-	{
-		struct timeval now;
-		gettimeofday(&now, NULL);
-		elapsed = (now.tv_sec  - g_last_tv.tv_sec) +
-			  (now.tv_usec - g_last_tv.tv_usec) / 1000000.0;
-	}
+	/* elapsed = 当前帧采集时间 - 上一帧采集时间 (秒) */
+	elapsed = (g_tv_curr.tv_sec  - g_tv_prev.tv_sec) +
+		  (g_tv_curr.tv_usec - g_tv_prev.tv_usec) / 1000000.0;
+
 	if (elapsed <= 0.0)
 		return 0.0;
 
@@ -318,7 +320,7 @@ static void save_prev_cpu(void)
 		g_prev_count++;
 	}
 	qsort(g_prev, g_prev_count, sizeof(struct prev_cpu), cmp_prev_pid);
-	gettimeofday(&g_last_tv, NULL);
+	/* 时间戳在 update_data() 中记录, 不在 save 时记录 */
 }
 
 static const char *fmt_size(unsigned long bytes)
@@ -417,6 +419,11 @@ static int fetch_stat(void)
 static int update_data(void)
 {
 	int ok = 1;
+
+	/* 记录数据采集时间: 上一帧时间 ← 当前帧时间, 然后记录当前时间 */
+	g_tv_prev = g_tv_curr;
+	gettimeofday(&g_tv_curr, NULL);
+
 	if (fetch_procs() < 0) ok = 0;
 	if (fetch_tree() < 0)  ok = 0;
 	if (fetch_stat() < 0)  ok = 0;
@@ -1567,9 +1574,13 @@ int main(void)
 		ch = wgetch(win_main);
 
 		if (ch == ERR) {
-			/* 超时: 自动刷新数据 */
+			/* 超时: 自动刷新数据
+			 * save_prev_cpu() 保存当前帧的 CPU 滴答值
+			 * update_data() 采集新数据并记录时间戳
+			 * cpu_pct() 使用 g_tv_curr - g_tv_prev 计算真实耗时 */
 			save_prev_cpu();
-			update_data();
+			if (update_data() == 0)
+				g_has_prev = 1;
 			sort_procs();
 			continue;
 		}
