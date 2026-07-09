@@ -25,7 +25,7 @@ static void test_proc_collect(void)
 	int count = 0;
 	long ret;
 
-	printf("[TEST 1] sys_proc_collect (462) ... ");
+	printf("[TEST 1] sys_proc_collect (%d) ... ", SYS_proc_collect);
 
 	ret = syscall(SYS_proc_collect, buf, TEST_COUNT, &count);
 
@@ -48,7 +48,7 @@ static void test_proc_snapshot(void)
 	int count = 0;
 	long ret;
 
-	printf("[TEST 2] sys_proc_snapshot (463) ... ");
+	printf("[TEST 2] sys_proc_snapshot (%d) ... ", SYS_proc_snapshot);
 
 	ret = syscall(SYS_proc_snapshot, buf, TEST_COUNT, &count);
 
@@ -70,7 +70,7 @@ static void test_proc_stat(void)
 	struct proc_stat stat;
 	long ret;
 
-	printf("[TEST 3] sys_proc_stat (464) ... ");
+	printf("[TEST 3] sys_proc_stat (%d) ... ", SYS_proc_stat);
 
 	ret = syscall(SYS_proc_stat, &stat);
 

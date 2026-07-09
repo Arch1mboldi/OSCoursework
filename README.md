@@ -163,13 +163,13 @@ sudo ./procmon
 
 依据：**`Documentation/process/adding-syscalls.rst`**
 
-| 实现要点 | 内核文档要求 | 对应代码 |
-|:---|:---|:---|
-| 使用 `SYSCALL_DEFINEn()` 宏 | L200-204: *"add this entry point with the appropriate `SYSCALL_DEFINEn()` macro"* | `kernel/proc_monitor.c` L48/168/223 |
-| x86_64 系统调用表注册 | L300-309: *"a 'common' entry in `syscall_64.tbl`: `333 common xyzzy sys_xyzzy`"* | `syscall_64.tbl.patch` |
-| 在 `include/linux/syscalls.h` 添加原型 | L207-211: *"a corresponding function prototype, marked as asmlinkage"* | 待补充 |
-| 在 `kernel/sys_ni.c` 添加回退桩 | L225-229: *"Add your new system call here too: `COND_SYSCALL(xyzzy);`"* | 待补充 |
-| 设计可扩展的数据结构 | L83-103: 推荐用结构体封装参数，含 `size` 字段支持未来扩展 | `proc_info` 等结构体经 `copy_to_user()` 传递 |
+| 实现要点                              | 内核文档要求                                                                            | 对应代码                                  |
+| :-------------------------------- | :-------------------------------------------------------------------------------- | :------------------------------------ |
+| 使用 `SYSCALL_DEFINEn()` 宏          | L200-204: *"add this entry point with the appropriate `SYSCALL_DEFINEn()` macro"* | `kernel/proc_monitor.c` L48/168/223   |
+| x86_64 系统调用表注册                    | L300-309: *"a 'common' entry in `syscall_64.tbl`: `333 common xyzzy sys_xyzzy`"*  | `syscall_64.tbl.patch`                |
+| 在 `include/linux/syscalls.h` 添加原型 | L207-211: *"a corresponding function prototype, marked as asmlinkage"*            | 待补充                                   |
+| 在 `kernel/sys_ni.c` 添加回退桩         | L225-229: *"Add your new system call here too: `COND_SYSCALL(xyzzy);`"*           | 待补充                                   |
+| 设计可扩展的数据结构                        | L83-103: 推荐用结构体封装参数，含 `size` 字段支持未来扩展                                             | `proc_info` 等结构体经 `copy_to_user()` 传递 |
 
 ### 2. 进程链表遍历与 RCU 同步
 
@@ -293,10 +293,10 @@ Linux 5.14+ 将 `task_struct` 的 `state` 重命名为 **`__state`**，并引入
 
 | 要点 | 说明 | 文档依据 |
 |:---|:---|:---|
-| 锁机制 | `read_lock(&tasklist_lock)` 保护进程链表遍历 | `RCU/listRCU.rst` — 推荐 `rcu_read_lock()` |
-| 锁释放时机 | `copy_to_user()` 可能睡眠，必须在释放锁后调用 | `RCU/rcu.rst` — RCU 读者不可阻塞 |
+| 锁机制 | 持锁保存 `next_task()` 指针 → 释放锁 `copy_to_user` → 用保存的指针继续遍历，杜绝 UAF | `RCU/listRCU.rst` |
+| 锁释放时机 | `copy_to_user()` 可能睡眠，必须释放锁后调用 | `RCU/rcu.rst` — RCU 读者不可阻塞 |
 | 内核线程处理 | `mm==NULL` 的内核线程无用户态内存，vsize/rss 填 0 | `mm/active_mm.rst` L44-46 |
-| 状态编码 | Linux 6.x 使用 `task->__state`；`exit_state` 存退出状态（僵尸/死） | `include/linux/sched.h` |
+| 状态编码 | Linux 5.14+：`__state` 存调度状态，`exit_state` 存退出状态 (ZOMBIE/DEAD)；内核报告 `__state \| exit_state` | `include/linux/sched.h` |
 | 逐个拷贝 | 每个条目单独 `copy_to_user()`，避免内核栈分配过大数组 | `adding-syscalls.rst` 安全要求 |
 | CPU 时间 | `task_cputime()` + `nsec_to_clock_t()` → USER_HZ 滴答 | `sched/cputime.h` + `proc.rst` L338-339 |
 | 内存信息 | `total_vm << PAGE_SHIFT` (字节) + `get_mm_rss()` (页数) | `proc.rst` L347-348 |

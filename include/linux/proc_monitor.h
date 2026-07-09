@@ -6,9 +6,9 @@
  * 放在 include/linux/ 下，内核代码和用户态代码均可 #include。
  *
  * 对应系统调用:
- *   sys_proc_collect  (462) — 收集所有进程信息
- *   sys_proc_snapshot (463) — 进程树拓扑快照
- *   sys_proc_stat     (464) — 系统进程统计
+ *   sys_proc_collect  (470) — 收集所有进程信息
+ *   sys_proc_snapshot (471) — 进程树拓扑快照
+ *   sys_proc_stat     (472) — 系统进程统计
  */
 
 #ifndef _LINUX_PROC_MONITOR_H
@@ -16,7 +16,9 @@
 
 #include <linux/types.h>
 
+#ifndef TASK_COMM_LEN
 #define TASK_COMM_LEN 16
+#endif
 
 /*
  * struct proc_info — 单个进程的完整信息

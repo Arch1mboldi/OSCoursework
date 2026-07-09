@@ -110,29 +110,42 @@ static const char *cstr(const char comm[16])
 	return buf;
 }
 
+/*
+ * Linux 6.x 进程状态使用位掩码编码:
+ *   __state bits:  TASK_RUNNING=0x00, INTERRUPTIBLE=0x01, UNINTERRUPTIBLE=0x02,
+ *                  __TASK_STOPPED=0x04, __TASK_TRACED=0x08, TASK_DEAD=0x40
+ *   exit_state:    EXIT_DEAD=0x10, EXIT_ZOMBIE=0x20
+ * 内核报告 state = __state | exit_state, 故需用位检测而非精确匹配。
+ * 参见: include/linux/sched.h (Linux 6.18)
+ */
 static char state_char(int state)
 {
-	switch (state) {
-	case 0:  return 'R';
-	case 1:  return 'S';
-	case 2:  return 'D';
-	case 4:  return 'T';
-	case 8:  return 't';
-	case 16: return 'Z';
-	case 32: return 'X';
+	/* 退出状态优先检测 */
+	if (state & 0x20) return 'Z';  /* EXIT_ZOMBIE   */
+	if (state & 0x10) return 'X';  /* EXIT_DEAD     */
+
+	/* 调度状态 — 用位检测 (Linux 6.x 组合了 WAKEKILL 等标志位) */
+	if (state & 0x08) return 't';  /* __TASK_TRACED  */
+	if (state & 0x04) return 'T';  /* __TASK_STOPPED */
+
+	switch (state & 0x03) {        /* 低 2 位 = 基本调度状态 */
+	case 0:  return 'R';           /* TASK_RUNNING         */
+	case 1:  return 'S';           /* TASK_INTERRUPTIBLE   */
+	case 2:  return 'D';           /* TASK_UNINTERRUPTIBLE */
 	default: return '?';
 	}
 }
 
 static const char *state_name(int state)
 {
-	switch (state) {
+	if (state & 0x20) return "ZOMBIE";
+	if (state & 0x10) return "DEAD";
+	if (state & 0x08) return "TRACED";
+	if (state & 0x04) return "STOPPED";
+	switch (state & 0x03) {
 	case 0:  return "RUNNING";
 	case 1:  return "SLEEPING";
 	case 2:  return "DISK_WAIT";
-	case 4:  return "STOPPED";
-	case 8:  return "TRACED";
-	case 16: return "ZOMBIE";
 	default: return "IDLE/OTHER";
 	}
 }
