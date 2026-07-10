@@ -279,25 +279,50 @@ SYSCALL_DEFINE1(proc_stat,
 		} else if (task->exit_state & EXIT_DEAD) {
 			/* EXIT_DEAD: 跳过，不计入任何活跃分类 */
 		} else {
-			/* 调度状态 (__state): 对活跃进程分类 */
-			switch (task->__state) {
-			case TASK_RUNNING:
-				kstat.running_processes++;
-				break;
-			case TASK_INTERRUPTIBLE:
-				kstat.sleeping_processes++;
-				break;
-			case TASK_UNINTERRUPTIBLE:
-				kstat.uninterruptible++;
-				break;
-			case TASK_STOPPED:
-			case TASK_TRACED:
-				kstat.stopped_processes++;
-				break;
-			default:
-				/* TASK_IDLE, TASK_NEW 等 */
+			/*
+			 * 调度状态 (__state): 对活跃进程分类。
+			 *
+			 * __state 可能带有附加标志位:
+			 *   TASK_WAKEKILL (0x0080) — 可被信号杀死
+			 *   TASK_NOLOAD   (0x0400) — 空闲任务,不计负载
+			 *   TASK_WAKING   (0x0100) — 正在被唤醒
+			 *
+			 * 必须先用掩码清除标志位，再对基础状态做 switch，
+			 * 否则 0x0081 (INTERRUPTIBLE|WAKEKILL) 等值无法
+			 * 匹配任何 case，会误入 default idle 分支。
+			 *
+			 * 掩码设计:
+			 *   TASK_REPORT = 0x007f — 包含所有基础状态位
+			 *   TASK_WAKEKILL 在其范围之外，会被掩码清除。
+			 *   TASK_NOLOAD 单独检测，因为 TASK_IDLE 语义上
+			 *   是 UNINTERRUPTIBLE 加上 NOLOAD 标志，应归 idle。
+			 */
+			unsigned int s = task->__state;
+
+			if (s & TASK_NOLOAD) {
+				/* TASK_IDLE 等空闲内核线程 */
 				kstat.idle_processes++;
-				break;
+			} else {
+				s &= ~(TASK_WAKEKILL | TASK_WAKING);
+				switch (s) {
+				case TASK_RUNNING:
+					kstat.running_processes++;
+					break;
+				case TASK_INTERRUPTIBLE:
+					kstat.sleeping_processes++;
+					break;
+				case TASK_UNINTERRUPTIBLE:
+					kstat.uninterruptible++;
+					break;
+				case __TASK_STOPPED:
+				case __TASK_TRACED:
+					kstat.stopped_processes++;
+					break;
+				default:
+					/* TASK_NEW, TASK_DEAD 等过渡状态 */
+					kstat.idle_processes++;
+					break;
+				}
 			}
 		}
 

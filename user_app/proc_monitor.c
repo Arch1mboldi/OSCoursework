@@ -1119,16 +1119,26 @@ static void render_syscall_view(int max_rows, int cols)
 	/* 交叉验证: 用 proc_info 数出的状态与 proc_stat 对比 */
 	row++;
 	if (row < max_rows - 1) {
-		int local_r = 0, local_s = 0, local_d = 0, local_t = 0, local_z = 0;
+		int local_r = 0, local_s = 0, local_d = 0, local_t = 0, local_z = 0, local_i = 0;
 		for (int i2 = 0; i2 < g_proc_count; i2++) {
 			int st = g_procs[i2].state;
 			if (st & 0x20) local_z++;
 			else if (!(st & 0x10)) {
-				switch (st & 0x03) {
-				case 0: local_r++; break;
-				case 1: local_s++; break;
-				case 2: local_d++; break;
-				default: break;
+				/*
+				 * 与内核 proc_stat 保持一致:
+				 *   TASK_NOLOAD (0x0400) → idle
+				 *   掩码 TASK_WAKEKILL (0x0080) 后再按基础状态分类
+				 */
+				if (st & 0x0400) {
+					local_i++;
+				} else {
+					int base = (st & ~0x0080) & 0x03;
+					switch (base) {
+					case 0: local_r++; break;
+					case 1: local_s++; break;
+					case 2: local_d++; break;
+					default: break;
+					}
 				}
 			}
 			if (st & 0x04) local_t++;
@@ -1156,6 +1166,11 @@ static void render_syscall_view(int max_rows, int cols)
 			  "Z: proc_info=%-5d  proc_stat=%-5d  %s",
 			  local_z, g_stat.zombie_processes,
 			  local_z == g_stat.zombie_processes ? "OK" : "MISMATCH!");
+		row++;
+		mvwprintw(win_main, row, 4,
+			  "I: proc_info=%-5d  proc_stat=%-5d  %s",
+			  local_i, g_stat.idle_processes,
+			  local_i == g_stat.idle_processes ? "OK" : "MISMATCH!");
 		row++;
 		mvwprintw(win_main, row, 4,
 			  "Note: mismatches expected due to race between collect & stat syscalls");
