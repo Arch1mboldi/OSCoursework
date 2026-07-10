@@ -9,29 +9,37 @@
 ## 目录
 
 1. [系统架构](#1-系统架构)
-2. [数据结构：内核-用户态 ABI 契约](#2-数据结构内核-用户态-abi-契约)
-3. [内核侧：3 个系统调用](#3-内核侧3-个系统调用)
-   - [3.1 sys_proc_collect (470) — 进程全量采集](#31-sys_proc_collect-470--进程全量采集)
-   - [3.2 sys_proc_snapshot (471) — 进程树快照](#32-sys_proc_snapshot-471--进程树快照)
-   - [3.3 sys_proc_stat (472) — 聚合统计](#33-sys_proc_stat-472--聚合统计)
-4. [内核关键机制](#4-内核关键机制)
-   - [4.1 锁策略：lock-drop-copy-relock](#41-锁策略lock-drop-copy-relock)
-   - [4.2 进程状态编码](#42-进程状态编码)
-   - [4.3 CPU 时间采集](#43-cpu-时间采集)
-   - [4.4 内存信息采集](#44-内存信息采集)
-   - [4.5 安全性保证](#45-安全性保证)
-5. [用户态：ncurses 调试版 TUI](#5-用户态ncurses-调试版-tui)
-   - [5.1 面板布局](#51-面板布局)
-   - [5.2 系统调用层与耗时测量](#52-系统调用层与耗时测量)
-   - [5.3 状态解码算法](#53-状态解码算法)
-   - [5.4 CPU% 计算](#54-cpu-计算)
-   - [5.5 五视图模式](#55-五视图模式)
-   - [5.6 过滤引擎](#56-过滤引擎)
-   - [5.7 进程树渲染](#57-进程树渲染)
-   - [5.8 数据导出](#58-数据导出)
-   - [5.9 交叉验证](#59-交叉验证)
-6. [编译与部署](#6-编译与部署)
-7. [调试指南](#7-调试指南)
+2. [开发者速览 (Developer Quick Start)](#2-开发者速览-developer-quick-start)
+   - [2.1 项目概览](#21-项目概览)
+   - [2.2 两端约定 (Frontend/Backend Contract)](#22-两端约定-frontendbackend-contract)
+   - [2.3 必知的操作系统概念](#23-必知的操作系统概念)
+   - [2.4 常见陷阱 (Gotchas)](#24-常见陷阱-gotchas)
+3. [数据结构：内核-用户态 ABI 契约](#3-数据结构内核-用户态-abi-契约)
+4. [内核侧：3 个系统调用](#4-内核侧3-个系统调用)
+   - [4.1 sys_proc_collect (470) — 进程全量采集](#41-sys_proc_collect-470--进程全量采集)
+   - [4.2 sys_proc_snapshot (471) — 进程树快照](#42-sys_proc_snapshot-471--进程树快照)
+   - [4.3 sys_proc_stat (472) — 聚合统计](#43-sys_proc_stat-472--聚合统计)
+5. [内核关键机制](#5-内核关键机制)
+   - [5.1 锁策略：lock-drop-copy-relock](#51-锁策略lock-drop-copy-relock)
+   - [5.2 进程状态编码](#52-进程状态编码)
+   - [5.3 CPU 时间采集](#53-cpu-时间采集)
+   - [5.4 内存信息采集](#54-内存信息采集)
+   - [5.5 安全性保证](#55-安全性保证)
+6. [用户态：ncurses 调试版 TUI](#6-用户态ncurses-调试版-tui)
+   - [6.1 面板布局](#61-面板布局)
+   - [6.2 系统调用层与耗时测量](#62-系统调用层与耗时测量)
+   - [6.3 状态解码算法](#63-状态解码算法)
+   - [6.4 CPU% 计算](#64-cpu-计算)
+   - [6.5 五视图模式](#65-五视图模式)
+   - [6.6 过滤引擎](#66-过滤引擎)
+   - [6.7 进程树渲染](#67-进程树渲染)
+   - [6.8 数据导出](#68-数据导出)
+   - [6.9 交叉验证](#69-交叉验证)
+7. [编译与部署](#7-编译与部署)
+8. [调试指南](#8-调试指南)
+附录 A. [内核状态位参考](#附录-a-内核状态位参考)
+附录 B. [proc_info 字段与 /proc/pid/stat 对照](#附录-b-proc_info-字段与-procpidstat-对照)
+附录 C. [Bugs Fixed & Lessons Learned](#附录-c-bugs-fixed--lessons-learned)
 
 ---
 
@@ -74,12 +82,92 @@
 
 ---
 
-## 2. 数据结构：内核-用户态 ABI 契约
+## 2. 开发者速览 (Developer Quick Start)
+
+> 如果你只有 5 分钟，读这一节就够了。其余章节是详细参考手册。
+
+### 2.1 项目概览
+
+本项目的目标是**监控 Linux 系统中所有进程的状态**，像一个自制的 `htop`。
+
+| 组件 | 位置 | 角色 |
+|:---|:---|:---|
+| **后端 (内核模块)** | `kernel/proc_monitor.c` | 3 个自定义系统调用，遍历 `task_struct` 链表采集数据 |
+| **前端 (用户态 TUI)** | `user_app/proc_monitor.c` | ncurses 终端界面，5 种视图模式展示数据 |
+| **ABI 头文件** | `include/linux/proc_monitor.h` ↔ `user_app/proc_monitor.h` | 结构体定义，两边必须逐字节一致 |
+| **数据通道** | `syscall(470/471/472)` → `copy_to_user()` | 内核栈 → 用户态 buffer，单向流动 |
+
+关键数字: **3** 个系统调用 · **3** 个核心结构体 (80B / 28B / 36B on x86_64) · **5** 种视图 · **8192** 进程上限。
+
+### 2.2 两端约定 (Frontend/Backend Contract)
+
+前后端通过**二进制 ABI** 通信。理解这 3 条规则即可安全修改代码：
+
+**规则 1: 结构体定义必须逐字节一致**
+
+```
+内核: include/linux/proc_monitor.h  ┐
+                                    ├─ 字段名、类型、顺序、对齐完全一致
+用户: user_app/proc_monitor.h       ┘
+```
+
+修改任何 `struct proc_info` / `proc_tree_node` / `proc_stat` 时，**两边必须同时改**。用 HEX-DUMP 视图 (按 `4`) 验证内存布局。sizeof 不一致会导致数据错位、字段读取乱码。
+
+**规则 2: 数据单向流动，通过 `copy_to_user()`**
+
+```
+内核 task_struct ──提取字段──► proc_info (内核栈)
+        └── copy_to_user() ──► 用户态 g_procs[]
+```
+
+- 内核**绝不**向用户态暴露指针 (`task_struct*`、`mm*` 等内核地址)
+- `from_kuid_munged()` 将内核 UID 映射到调用者命名空间
+- `nsec_to_clock_t()` 将纳秒 CPU 时间转为 USER_HZ 滴答（与 `/proc/pid/stat` 一致）
+
+**规则 3: 状态编码必须两端一致解释** (详见 [§5.2](#52-进程状态编码) + [§C.4](#c4-状态分类失配-state-classification-mismatch))
+
+内核传递 `state = task->__state | task->exit_state`。这是一个**位掩码**，不是枚举值。附加标志位 (`TASK_WAKEKILL=0x80`, `TASK_NOLOAD=0x400`) 会 OR 到基础状态上 (e.g. `0x01 | 0x80 = 0x81`)。**内核分类和用户态解码都必须先用掩码清除标志位**，再用位检测 (`& 0x03`) 判断基础状态。精确值 `switch(state)` 会漏掉所有带标志位的进程——曾经修过这个 bug。
+
+### 2.3 必知的操作系统概念
+
+在动手修改代码前，至少了解以下 6 个概念。
+
+**`task_struct`** — 内核描述一个进程/线程的结构体，包含 PID、状态、CPU 时间、内存、父进程指针等所有信息。本项目本质上是 `task_struct` 的"远程查看器"。参见内核源码 `include/linux/sched.h`。
+
+**RCU (Read-Copy-Update) + `tasklist_lock`** — 进程链表通过 RCU 保护。读端用 `read_lock(&tasklist_lock)` 加锁。**关键约束: RCU 临界区内不能睡眠**——如果持锁期间 `copy_to_user()` 触发缺页异常，会睡眠等待磁盘 I/O，破坏 RCU 语义甚至死锁。这就是 "lock-drop-copy-relock" 模式存在的根本原因。参见 `Documentation/RCU/listRCU.rst`。
+
+**`copy_to_user()` 可能睡眠** — 用户态 buffer 所在页面可能被换出 (swap)。访问时触发缺页异常 → 磁盘 I/O → 睡眠。因此 **绝不能在持有自旋锁或 RCU 读锁时调用 `copy_to_user()`**。正确做法: 持锁读取数据 → 保存 next 指针 → 释放锁 → `copy_to_user()` → 重新加锁 → 用保存的 next 继续遍历。
+
+**进程状态位掩码** — Linux 6.x 将状态拆分为 `__state` (调度状态) 和 `exit_state` (退出状态):
+```
+__state:     0x00=RUNNING  0x01=INTERRUPTIBLE  0x02=UNINTERRUPTIBLE
+             0x04=STOPPED  0x08=TRACED  0x40=DEAD
+             0x80=WAKEKILL (标志)  0x100=WAKING (标志)  0x400=NOLOAD (标志)
+exit_state:  0x10=EXIT_DEAD  0x20=EXIT_ZOMBIE
+```
+标志位会 OR 到基础状态上: `TASK_INTERRUPTIBLE | TASK_WAKEKILL = 0x0081`。**必须掩码清除标志位后才能 switch 基础状态**（内核用 `s &= ~(TASK_WAKEKILL|TASK_WAKING)`，用户态用 `state & 0x03`）。
+
+**USER_HZ / 时钟滴答** — CPU 时间以"时钟滴答"(jiffies) 为单位。`sysconf(_SC_CLK_TCK)` 获取，通常为 100 (每滴答 10ms)。内核用 `nsec_to_clock_t()` 将纳秒转为滴答，用户态用 `cpu_pct()` 计算相邻两帧之间的 CPU%。参见 `man 5 proc` 中 `/proc/pid/stat` 的 (14)(15) 字段。
+
+**内核线程** — `task->mm == NULL` 表示没有用户态地址空间。内核线程的 `vsize=0, rss=0`，单独计入 `kernel_threads`。用户态通过检查 `mm != NULL` 区分。参见 `Documentation/mm/active_mm.rst`。
+
+### 2.4 常见陷阱 (Gotchas)
+
+| # | 陷阱 | 表现 | 教训 | 详见 |
+|---|------|------|------|------|
+| 1 | 排序度量与显示不一致 | 按 CPU% 列排序但实际按累计滴答排 | `cmp_cpu()` 必须用 delta-based CPU%，不是 `utime+stime` | [§C.1](#c1-cpu-排序度量错误-cpu-sort-metric) |
+| 2 | 按键只处理小写 | 按 `V` 无法切换视图 | ncurses 区分大小写，`case 'V':` 也要加 | [§C.2](#c2-v-键视图切换失效-v-key-not-switching) |
+| 3 | 状态变量跨视图复用 | HEX-DUMP 中上下键切换进程而非滚动 | 不同视图的"光标"含义不同，需独立状态变量 | [§C.3](#c3-hex-dump-导航混乱-hex-dump-navigation) |
+| 4 | 精确匹配状态值 | proc_stat 与 proc_info 交叉验证大量 MISMATCH | 必须掩码清除标志位，不能 `switch(state)` 精确匹配 | [§C.4](#c4-状态分类失配-state-classification-mismatch) |
+
+---
+
+## 3. 数据结构：内核-用户态 ABI 契约
 
 三个结构体定义在 `include/linux/proc_monitor.h`（内核侧）和 `user_app/proc_monitor.h`（用户态侧）。
 两边定义**必须逐字节一致**——struct 大小、字段偏移、对齐方式完全相同，构成二进制 ABI 契约。
 
-### 2.1 `struct proc_info` — 进程完整信息
+### 3.1 `struct proc_info` — 进程完整信息
 
 ```c
 struct proc_info {
@@ -119,7 +207,7 @@ Offset  Size  Field        Notes
 Total: 80 bytes
 ```
 
-### 2.2 `struct proc_tree_node` — 进程树节点
+### 3.2 `struct proc_tree_node` — 进程树节点
 
 ```c
 struct proc_tree_node {
@@ -133,7 +221,7 @@ struct proc_tree_node {
 
 `level` 由内核 `compute_level()` 计算：从当前进程沿 `real_parent` 向上追溯到 `init_task`，累计层数。
 
-### 2.3 `struct proc_stat` — 聚合统计
+### 3.3 `struct proc_stat` — 聚合统计
 
 ```c
 struct proc_stat {
@@ -152,7 +240,7 @@ struct proc_stat {
 
 ---
 
-## 3. 内核侧：3 个系统调用
+## 4. 内核侧：3 个系统调用
 
 系统调用号在 `arch/x86/entry/syscalls/syscall_64.tbl` 中注册：
 
@@ -162,7 +250,7 @@ struct proc_stat {
 472  common  proc_stat      sys_proc_stat
 ```
 
-### 3.1 sys_proc_collect (470) — 进程全量采集
+### 4.1 sys_proc_collect (470) — 进程全量采集
 
 **签名**: `long sys_proc_collect(struct proc_info *user_buf, int max_count, int *ret_count)`
 
@@ -187,7 +275,7 @@ struct proc_stat {
 
 **返回值**: 0 成功；`-EINVAL` 参数无效；`-EFAULT` copy_to_user 失败（尽力返回已拷贝数量）。
 
-### 3.2 sys_proc_snapshot (471) — 进程树快照
+### 4.2 sys_proc_snapshot (471) — 进程树快照
 
 **签名**: `long sys_proc_snapshot(struct proc_tree_node *user_buf, int max_count, int *ret_count)`
 
@@ -202,7 +290,7 @@ struct proc_stat {
 
 用户态可基于 `pid/ppid` 自行重建树结构，也可直接使用 `level` 按缩进渲染。
 
-### 3.3 sys_proc_stat (472) — 聚合统计
+### 4.3 sys_proc_stat (472) — 聚合统计
 
 **签名**: `long sys_proc_stat(struct proc_stat *stat)`
 
@@ -217,24 +305,33 @@ for_each_process(task):
     if (task->exit_state & EXIT_ZOMBIE)     → zombie_processes++
     else if (task->exit_state & EXIT_DEAD)  → (skip, 不计入活跃分类)
     else:
-        switch (task->__state):
-            TASK_RUNNING         → running_processes++
-            TASK_INTERRUPTIBLE   → sleeping_processes++
-            TASK_UNINTERRUPTIBLE → uninterruptible++
-            TASK_STOPPED/TRACED  → stopped_processes++
-            default              → idle_processes++
+        unsigned int s = task->__state;
+
+        if (s & TASK_NOLOAD):
+            // TASK_IDLE = UNINTERRUPTIBLE | NOLOAD, 语义上属空闲
+            idle_processes++
+        else:
+            s &= ~(TASK_WAKEKILL | TASK_WAKING);  // 清除标志位
+            switch (s):
+                TASK_RUNNING             → running_processes++
+                TASK_INTERRUPTIBLE       → sleeping_processes++
+                TASK_UNINTERRUPTIBLE     → uninterruptible++
+                __TASK_STOPPED / __TASK_TRACED → stopped_processes++
+                default                  → idle_processes++
 
     if (task->mm == NULL) → kernel_threads++
     else                  → user_threads++
 ```
 
+> **为什么必须用位掩码而不是精确匹配**: Linux 6.x 的 `__state` 可能带有额外标志位，如 `TASK_WAKEKILL (0x0080)`、`TASK_WAKING (0x0100)` 和 `TASK_NOLOAD (0x0400)`。一个可被杀死的睡眠进程 `__state = 0x01 | 0x80 = 0x0081`。若用精确 `switch(task->__state)` 匹配，`0x0081` 不等于 `TASK_INTERRUPTIBLE (0x0001)`，会落入 `default` 分支被误判为 idle。掩码策略: 先检测 `TASK_NOLOAD`（因为 `TASK_IDLE` 语义上就是空闲），再 `s &= ~(TASK_WAKEKILL|TASK_WAKING)` 清除干扰位，最后 switch 匹配基础状态。早期版本因未做此处理导致 proc_stat 与 proc_info 交叉验证出现大量 MISMATCH。详见 [附录 C.4](#c4-状态分类失配-state-classification-mismatch)。
+
 > **注意**: `for_each_process()` 使用 `read_lock(&tasklist_lock)` 持锁遍历，全程持锁不释放——与 collect/snapshot 的锁策略不同，因为此函数不在持锁期间调用可能睡眠的 `copy_to_user()`。
 
 ---
 
-## 4. 内核关键机制
+## 5. 内核关键机制
 
-### 4.1 锁策略：lock-drop-copy-relock
+### 5.1 锁策略：lock-drop-copy-relock
 
 这是 **sys_proc_collect** 和 **sys_proc_snapshot** 最核心的设计。
 
@@ -267,7 +364,7 @@ read_unlock(&tasklist_lock);
 
 **sys_proc_stat 为什么不同**: 该函数在持锁循环内不做任何可能睡眠的操作（不调用 `copy_to_user()`），只在循环结束后统一拷贝一次，因此可以全程持锁。
 
-### 4.2 进程状态编码
+### 5.2 进程状态编码
 
 Linux 5.14+ 将原来的 `task->state` 拆分为两个字段：
 
@@ -291,7 +388,16 @@ if (state & 0x04)       return 'T';  // __TASK_STOPPED
 switch (state & 0x03) { ... }       // 低2位 = 基本调度状态
 ```
 
-### 4.3 CPU 时间采集
+
+> **两侧问题 (Kernel + Userspace)**: 相同的标志位陷阱同时影响内核和用户态。内核
+> `sys_proc_stat` 也必须掩码清除 `TASK_WAKEKILL` 和 `TASK_WAKING`，否则
+> `state=0x0081` 会落入 `default` → idle（详见 [§4.3](#43-sys_proc_stat-472--聚合统计)）。
+> 用户态交叉验证代码同步做了同样的掩码处理（先检查 `TASK_NOLOAD`，再
+> `st & ~0x0080` 清除 WAKEKILL，最后 `& 0x03` 分类）。这不是可选优化，
+> 而是 **Linux 6.x 上正确分类的必要条件**。早期版本因两侧都未掩码，
+> 导致交叉验证出现大量 MISMATCH（详见 [§C.4](#c4-状态分类失配-state-classification-mismatch)）。
+
+### 5.3 CPU 时间采集
 
 发行版内核 (`CONFIG_VIRT_CPU_ACCOUNTING_GEN=y`) 以**纳秒**精度存储 CPU 时间。直接读 `task->utime` 会得到纳秒值，而非传统的 jiffies。
 
@@ -305,7 +411,7 @@ nsec_to_clock_t(ut_ns)              → USER_HZ 时钟滴答 (与 /proc/pid/stat
 - `task_cputime()`: 读取 utime + stime，单位纳秒
 - `nsec_to_clock_t()`: 转换为 `USER_HZ` 滴答，值 = `sysconf(_SC_CLK_TCK)`（通常 100）
 
-### 4.4 内存信息采集
+### 5.4 内存信息采集
 
 | 字段 | 采集方式 | 单位 | 与 /proc/pid/stat 关系 |
 |:---|:---|:---|:---|
@@ -314,7 +420,7 @@ nsec_to_clock_t(ut_ns)              → USER_HZ 时钟滴答 (与 /proc/pid/stat
 
 **内核线程**: `task->mm == NULL` → 无用户态地址空间 → `vsize = 0, rss = 0`
 
-### 4.5 安全性保证
+### 5.5 安全性保证
 
 | 安全措施 | 机制 |
 |:---|:---|
@@ -326,9 +432,9 @@ nsec_to_clock_t(ut_ns)              → USER_HZ 时钟滴答 (与 /proc/pid/stat
 
 ---
 
-## 5. 用户态：ncurses 调试版 TUI
+## 6. 用户态：ncurses 调试版 TUI
 
-### 5.1 面板布局
+### 6.1 面板布局
 
 ```
 ┌── win_main (rows - 6) ─────────────────────────────┐
@@ -348,7 +454,7 @@ nsec_to_clock_t(ut_ns)              → USER_HZ 时钟滴答 (与 /proc/pid/stat
 └────────────────────────────────────────────────────┘
 ```
 
-### 5.2 系统调用层与耗时测量
+### 6.2 系统调用层与耗时测量
 
 每个 syscall 通过 `syscall()` 函数调用，并用 `clock_gettime(CLOCK_MONOTONIC)` 测量耗时：
 
@@ -373,7 +479,7 @@ static int fetch_procs(void) {
 
 `update_data()` 按顺序调用 `fetch_procs()` → `fetch_tree()` → `fetch_stat()`，每次记录独立耗时。
 
-### 5.3 状态解码算法
+### 6.3 状态解码算法
 
 state 字段 = `__state | exit_state`，解码分三步：
 
@@ -402,7 +508,7 @@ switch (state & 0x03):
 
 > **为什么用位检测不用 `switch(state)`**: 因为 Linux 6.x 可能在 __state 中设置额外标志位（如 `TASK_WAKEKILL=0x80`、`TASK_NOLOAD=0x400`），导致 state 值不等于单一的枚举值。位检测只关心我们感兴趣的位。
 
-### 5.4 CPU% 计算
+### 6.4 CPU% 计算
 
 CPU% = 进程在两次采集之间消耗的 CPU 时间 / 实际经过的 wall-clock 时间。
 
@@ -440,7 +546,7 @@ CPU% = 进程在两次采集之间消耗的 CPU 时间 / 实际经过的 wall-cl
 - PID 复用 (cur_total < prev_total): CPU% = 0.0 (视为新进程)
 - elapsed ≤ 0: CPU% = 0.0 (防御性处理)
 
-### 5.5 五视图模式
+### 6.5 五视图模式
 
 | 模式 | 编号 | 用途 | 数据来源 |
 |:---|:---|:---|:---|
@@ -477,7 +583,7 @@ Field Map:
   ...
 ```
 
-### 5.6 过滤引擎
+### 6.6 过滤引擎
 
 过滤语法（在 `/` 键进入的过滤模式下输入）：
 
@@ -490,7 +596,7 @@ Field Map:
 
 过滤模式下 `filtered_count()` 和 `filtered_index(n)` 用于统计过滤后数量和定位第 n 个可见条目。
 
-### 5.7 进程树渲染
+### 6.7 进程树渲染
 
 基于 `proc_tree_node` 数组渲染 ASCII/Unicode 树：
 
@@ -506,7 +612,7 @@ Field Map:
 **`tree_is_last(i, count)`**: 检查节点 i 之后是否还有相同 ppid 的节点。
 **`tree_has_continuation(i, count, target_level)`**: 检查当前节点之后是否还有同一祖先的后代（用于决定竖线的延续）。
 
-### 5.8 数据导出
+### 6.8 数据导出
 
 按 `x` 键，根据当前视图模式选择导出格式：
 
@@ -516,7 +622,7 @@ Field Map:
 | TREE | DOT (Graphviz) | `proc_tree.dot` | 进程树有向图, 可 `dot -Tpng` 渲染 |
 | HEX / SYSCALL | 二进制 dump | `proc_dump.bin` | magic("PROC") + count + struct_size + g_procs 原始字节 |
 
-### 5.9 交叉验证
+### 6.9 交叉验证
 
 SYSCALL 视图底部包含交叉验证：用 `proc_info[]` 数组自己数出来的状态分布 vs `proc_stat` 报告的值。
 
@@ -526,15 +632,16 @@ R: proc_info=12    proc_stat=12    OK
 S: proc_info=280   proc_stat=280   OK
 D: proc_info=5     proc_stat=5     OK
 Z: proc_info=3     proc_stat=2     MISMATCH!
+I: proc_info=8     proc_stat=8     OK
 ```
 
-**出现 MISMATCH 的原因**: `fetch_procs()` 和 `fetch_stat()` 是两个独立的系统调用，存在时间窗口。在这两次调用之间，可能有进程退出（僵尸减少）或新进程创建。轻微不一致是正常的；大量不一致则提示内核模块有 bug。
+**出现 MISMATCH 的原因**: `fetch_procs()` 和 `fetch_stat()` 是两个独立的系统调用，存在时间窗口。在这两次调用之间，可能有进程退出（僵尸减少）或新进程创建。轻微的偶发不一致是正常的；**系统性、持续的大量 MISMATCH 则提示状态分类有 bug**——最常见的原因是内核或用户态使用了精确值匹配而未掩码清除 `TASK_WAKEKILL` / `TASK_NOLOAD` 等标志位（详见 [§C.4](#c4-状态分类失配-state-classification-mismatch)）。
 
 ---
 
-## 6. 编译与部署
+## 7. 编译与部署
 
-### 6.1 内核侧
+### 7.1 内核侧
 
 ```bash
 # 放入源码树
@@ -556,7 +663,7 @@ sudo make modules_install && sudo make install
 sudo update-grub && sudo reboot
 ```
 
-### 6.2 用户态
+### 7.2 用户态
 
 ```bash
 sudo apt install libncurses-dev    # ncurses 开发库
@@ -567,7 +674,7 @@ make test                           # 运行 syscall 验证
 sudo ./proc_monitor                 # 启动 TUI (需 root)
 ```
 
-### 6.3 Makefile
+### 7.3 Makefile
 
 ```makefile
 CC      = gcc
@@ -584,9 +691,9 @@ $(TARGET): proc_monitor.o proc_monitor.h
 
 ---
 
-## 7. 调试指南
+## 8. 调试指南
 
-### 7.1 验证 struct 大小一致性
+### 8.1 验证 struct 大小一致性
 
 启动 `proc_monitor` 后观察 stderr 输出：
 ```
@@ -595,13 +702,13 @@ $(TARGET): proc_monitor.o proc_monitor.h
 
 或切换到 SYSCALL 视图 (按 `5`)，查看 Struct Sizes 区域。如果用户态 sizeof 与内核不一致，说明头文件不同步或 ABI 不匹配。
 
-### 7.2 检查 state 位编码
+### 8.2 检查 state 位编码
 
 1. 切换到 LIST 视图，观察 `S:HEX` 列 — 显示原始 state 的十六进制值
 2. 选中一个进程，查看 `win_detail` 面板 Line 1 — 完整解码 `__state` 和 `exit_state`
 3. 使用 `=0xNN` 过滤器精确匹配特定状态组合
 
-### 7.3 检查 syscall 性能
+### 8.3 检查 syscall 性能
 
 切换到 SYSCALL 视图 (按 `5`)，查看每个 syscall 的延迟：
 - `proc_collect` 通常 < 2000μs（取决于进程数）
@@ -610,14 +717,14 @@ $(TARGET): proc_monitor.o proc_monitor.h
 
 如果延迟异常高，检查是否有大量进程或内核锁竞争。
 
-### 7.4 检查 struct 内存布局
+### 8.4 检查 struct 内存布局
 
 切换到 HEX-DUMP 视图 (按 `4`)，对比字段偏移标注与实际字节内容：
 - 检查 padding 是否正确（偏移 28 和 76 应为 4 字节填充）
 - 检查 `unsigned long` 字段是否在 8 字节对齐的地址上（偏移 32/40/48/56）
 - 如果布局不对，说明编译选项 (LP64 vs ILP32) 或 struct 定义不一致
 
-### 7.5 导出原始数据离线分析
+### 8.5 导出原始数据离线分析
 
 ```bash
 # CSV 导出 (LIST/DEBUG 视图中按 x)
@@ -631,7 +738,7 @@ xxd proc_dump.bin | head -20
 # Header: magic="PROC"(4B) + count(4B) + struct_size(4B) + g_procs[N]
 ```
 
-### 7.6 交叉验证
+### 8.6 交叉验证
 
 在 SYSCALL 视图中检查 Cross-check 区域。如果 `proc_info[]` 自己统计的值与 `proc_stat` 报告的值持续不一致（而非偶发），可能原因：
 
@@ -678,6 +785,69 @@ exit_state bits:
 | `vsize` | vsize | 23 | 字节 |
 | `rss` | rss | 24 | 页数 (× PAGE_SIZE = 字节) |
 | `uid` | (来自 /proc/pid/status) | — | — |
+
+---
+
+## 附录 C: Bugs Fixed & Lessons Learned
+
+本附录记录课程设计开发过程中已修复的 bug，每个条目包含症状、根因、修复、教训，
+供后续开发者参考。
+
+### C.1 CPU% 排序度量错误 (CPU Sort Metric)
+
+| 属性 | 详情 |
+|:---|:---|
+| **提交** | `f76bcf6` |
+| **文件** | `user_app/proc_monitor.c` (`cmp_cpu`) |
+| **症状** | 按 Tab 切换到"按 CPU% 排序"，显示顺序与 CPU% 列不一致。gnome-terminal (CPU%=3.0) 排在 gnome-shell (CPU%=10.8) 前面 |
+| **根因** | `cmp_cpu` 比较的是 `utime + stime` 累计滴答数（进程启动以来的总 CPU 时间），而非 `cpu_pct()` 计算的增量百分比。长运行时间的老进程自然有更高的累计值 |
+| **修复** | `cmp_cpu` 改为调用 `cpu_pct(pid, utime + stime)`，比较两帧之间的 delta-based CPU% |
+| **教训** | 当 UI 显示一个计算值（如百分比、速率）时，排序比较器必须使用相同的计算函数，而非原始累加值。排序度量必须与显示度量一致 |
+
+### C.2 V 键视图切换失效 (V Key Not Switching)
+
+| 属性 | 详情 |
+|:---|:---|
+| **提交** | `f76bcf6` |
+| **文件** | `user_app/proc_monitor.c` |
+| **症状** | 按 Shift+V 无法循环切换视图，但按 `1`-`5` 数字键可以。提示栏显示小写 `v`，按大写 V 无响应 |
+| **根因** | 按键处理 switch 中只写了 `case 'v':`，未处理 `case 'V':`。ncurses 的 `wgetch()` 区分大小写 |
+| **修复** | 添加 `case 'V':` 与 `case 'v':` 并列执行相同逻辑 |
+| **教训** | 处理键盘输入时，对无修饰字母键应同时检查大小写，除非有明确理由区分。这是一个在 ncurses 程序中极易被忽略的细节 |
+
+### C.3 HEX-DUMP 导航混乱 (HEX-DUMP Navigation)
+
+| 属性 | 详情 |
+|:---|:---|
+| **提交** | `f76bcf6` |
+| **文件** | `user_app/proc_monitor.c` (`render_hex_view`, `main`) |
+| **症状** | 在 HEX-DUMP 视图中按上下键：期望滚动 hex dump 内容，实际效果是切换了正在被 dump 的进程。且只能查看前几个进程的 hex dump |
+| **根因** | 全局变量 `g_selected` 被复用为两个正交概念：(a) 选中哪个进程（传给 `filtered_index()` 定位进程），(b) hex dump 中高亮哪一行。上下键改变 `g_selected` → 同时改变了进程选择 |
+| **修复** | 引入独立变量 `g_hex_selected` 跟踪被 dump 的进程（在过滤后列表中的索引）。`g_selected` 在 HEX-DUMP 视图中仅表示 hex 行光标。添加 `n`/`p` 键切换进程。进入/离开 HEX-DUMP 时在两者间同步 |
+| **教训** | 不同视图的"光标"有不同语义（进程索引 vs 字节偏移 vs 树节点）。绝不要用一个变量表示两个正交维度。视图切换时需显式管理状态变量的语义转换 |
+
+### C.4 状态分类失配 (State Classification Mismatch)
+
+| 属性 | 详情 |
+|:---|:---|
+| **提交** | `c463243` |
+| **文件** | `kernel/proc_monitor.c` (`sys_proc_stat`), `user_app/proc_monitor.c` (cross-check) |
+| **症状** | SYSCALL 视图交叉验证显示大量系统性 MISMATCH：`S: proc_info=224 proc_stat=211`（差 13），`D: proc_info=154 proc_stat=0`（差 154），`I: proc_stat=167 proc_info=0`。每次刷新都复现，不是偶发 |
+| **根因** | 内核 `sys_proc_stat` 使用精确值 `switch(task->__state)` 分类。Linux 6.x 的 `__state` 常带有标志位：`TASK_INTERRUPTIBLE|TASK_WAKEKILL = 0x0081`、`TASK_IDLE = 0x0402`。这些值不等于任何 case 标签（`TASK_INTERRUPTIBLE = 0x0001`、`TASK_UNINTERRUPTIBLE = 0x0002`），全部落入 `default` → idle。同时用户态交叉验证也未处理 `TASK_NOLOAD`，把 `TASK_IDLE (0x0402)` 误判为 D (因为 `0x0402 & 0x03 == 2`) |
+| **修复** | 内核：先检查 `TASK_NOLOAD` → idle，再 `s &= ~(TASK_WAKEKILL|TASK_WAKING)` 掩码，最后 switch 基础状态。用户态：同步增加 `0x0400` (NOLOAD) 检测和 `~0x0080` (WAKEKILL) 掩码 |
+| **教训** | Linux 5.14+ 分离 `__state` 和 `exit_state` 后，`__state` 变为位掩码而非枚举——这是影响面极大的架构变更。**内核和用户态两侧必须用一致的掩码策略**，精确 `switch(state)` 在 6.x 内核上必然出错。`TASK_REPORT` 掩码 (0x007f) 可用于提取纯净的基础状态 |
+
+### C.5 CPU% 时间戳记录位置错误 (CPU% Timestamp)
+
+| 属性 | 详情 |
+|:---|:---|
+| **提交** | `623dfcc` |
+| **文件** | `user_app/proc_monitor.c` (`save_prev_cpu`, `update_data`) |
+| **症状** | 第一帧之后的 CPU% 值异常巨大（数百甚至数千百分比） |
+| **根因** | 时间戳在 `save_prev_cpu()` 中记录（render 之前）。此时距 `cpu_pct()` 调用（render 期间）仅微秒级别，`elapsed ≈ 0` 导致 CPU% = `delta_ticks / (clk_tck * 0)` → 极大值 |
+| **修复** | 将时间戳记录 (`gettimeofday`) 移到 `update_data()` 中。`elapsed` 现在反映两次 syscall 数据采集之间的真实间隔 |
+| **教训** | CPU% = `delta_ticks / (clk_tck * delta_time)`。`delta_time` 必须是两次数据采集的间隔，不是两次渲染的间隔。时序逻辑须放在正确的时机——先采集数据（记录时间），再渲染（使用时间差） |
+
 
 ---
 
