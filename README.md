@@ -1,83 +1,26 @@
 # 实验三：Linux 系统调用 —— 进程全量监控与分析系统
 
-> **操作系统课程设计 · 实验三**  
-> Linux 6.18 内核 · 自定义系统调用  
-> 2026年7月
+操作系统课程设计 · 实验三
+Linux 6.18 内核 · 自定义系统调用 (470/471/472)
+2026年7月
 
 ---
 
 ## 项目概述
 
-在 Linux 6.18 内核中新增 **3 个自定义系统调用**，并编写用户态 C 程序通过 `syscall()` 直接调用，
-实现进程全量监控与分析系统。
+在 Linux 6.18 内核中新增 3 个自定义系统调用，并编写用户态 ncurses 终端程序，
+通过 `syscall()` 直接调用，实现进程全量监控。
 
-### 3 个系统调用
+**3 个系统调用**:
+- `sys_proc_collect` (470) — 采集所有进程的 PID、PPID、状态、CPU 时间、内存、线程数、UID
+- `sys_proc_snapshot` (471) — 返回进程树父子关系拓扑，含层级深度
+- `sys_proc_stat` (472) — 按状态分类的进程计数
 
-| 系统调用 | 编号 | 功能 |
-|:---|:---|:---|
-| `sys_proc_collect` | 470 | 一次性收集所有进程的完整信息 (PID/PPID/状态/CPU时间/内存/线程数/UID) |
-| `sys_proc_snapshot` | 471 | 返回进程树父子关系拓扑快照 (含层级深度) |
-| `sys_proc_stat` | 472 | 返回系统整体进程统计 (按状态分类 + 内核线程/用户进程) |
+**用户态程序**: ncurses 终端界面，4 面板布局（主视图、详情、系统调用诊断、按键提示），
+5 种视图模式（列表、原始数值表、进程树、十六进制内存 dump、系统调用诊断面板），
+支持排序、过滤、导出。
 
-### 用户态程序 (ncurses 调试版 TUI)
-
-`user_app/proc_monitor.c` 是一个以**调试友好**为设计目标的 ncurses 终端界面，
-面向开发人员调试内核模块时使用。
-
-**面板布局 (4 区域):**
-
-| 面板 | 内容 |
-|:---|:---|
-| win_main | 主视图区域，5 种模式可切换 |
-| win_detail | 选中进程的**全部 11 个 `proc_info` 字段** + `__state`/`exit_state` 位解码 |
-| win_syscall | 系统调用返回值 / errno / **延迟(μs)** / `proc_stat` 聚合统计 |
-| win_hint | 按键提示栏 |
-
-**5 种视图模式 (按 `v` 循环, 或数字键 `1`-`5` 直达):**
-
-| 模式 | 说明 |
-|:---|:---|
-| **LIST** `[1]` | 紧凑进程表格 — 含 state hex 原始值、CPU%、所有 11 字段 |
-| **DEBUG-TABLE** `[2]` | **所有字段作为原始数值** — 不做任何格式化/单位转换，与内核传回数据逐字节一致 |
-| **TREE** `[3]` | 进程树层次结构 — Unicode 树线绘制，按深度着色 |
-| **HEX-DUMP** `[4]` | 选中进程 `proc_info` 的**原始字节** + 字段偏移标注 (验证 struct 布局) |
-| **SYSCALL** `[5]` | 系统调用诊断面板 — 返回值 / errno / 耗时 / struct 大小 / cross-validation |
-
-**调试特性:**
-
-| 特性 | 说明 |
-|:---|:---|
-| 状态位解码 | state 字段分解为 `__state` 位 (INTR\|UNINTR\|STOP\|TRACE\|DEAD\|WAKEKILL) + `exit_state` 位 (ZOMBIE\|DEAD) |
-| 系统调用计时 | `clock_gettime(CLOCK_MONOTONIC)` 测量每个 syscall 的 wall-clock 延迟 (微秒) |
-| 交叉验证 | SYSCALL 视图对比 `proc_info[]` 计数 vs `proc_stat`，标记 MISMATCH |
-| 原始导出 | LIST/DEBUG → CSV / TREE → DOT (Graphviz) / HEX/SYSCALL → 二进制 dump (带 magic header) |
-| Struct 大小 | 启动时打印 `sizeof(proc_info/tree_node/stat)` 到 stderr，方便与内核对比 |
-| Hex state 过滤 | 支持 `=0x22` 精确匹配 state 位掩码，方便调试特定状态组合 |
-
-**按键绑定:**
-
-| 按键 | 功能 |
-|:---|:---|
-| `v` / `1`-`5` | 切换视图模式 |
-| `↑↓` / `j` `k` | 选择进程 |
-| `PgUp` / `PgDn` | 翻页 |
-| `Home` / `End` | 跳转到首/尾 |
-| `Tab` | 循环排序字段 (PID → CPU → MEM → NAME) |
-| `s` | 切换升序/降序 |
-| `/` | 进入过滤模式 |
-| `r` | 清除过滤 |
-| `x` | 导出 (CSV / DOT / RAW) |
-| `h` / `?` | 帮助 |
-| `q` / `ESC` | 退出 |
-
-**过滤语法:**
-
-| 输入 | 含义 |
-|:---|:---|
-| `bash` | 进程名包含 "bash" (大小写不敏感) |
-| `=R` | 状态为 Running |
-| `=0x22` | state 位掩码精确匹配 0x22 (调试!) |
-| `:1234` | PID 等于 1234 |
+详细设计文档参见 [`principles.md`](principles.md)。
 
 ---
 
@@ -85,300 +28,106 @@
 
 ```
 OSCoursework/
-├── kernel/
-│   ├── proc_monitor.c                   # [新建] 3个系统调用的内核实现
-│   └── Makefile.patch                   # kernel/Makefile 修改说明
-├── include/
-│   └── linux/
-│       └── proc_monitor.h               # [新建] 内核-用户态共享数据结构
-├── arch/
-│   └── x86/
-│       └── entry/
-│           └── syscalls/
-│               └── syscall_64.tbl.patch # 系统调用表注册说明
+├── kernel/proc_monitor.c          # 3 个系统调用的内核实现
+├── include/linux/proc_monitor.h   # 内核-用户态共享数据结构
 ├── user_app/
-│   ├── proc_monitor.h                   # 用户态头文件 (数据结构 + 系统调用号)
-│   ├── proc_monitor.c                   # 用户态监控主程序 (C ncurses 调试版 TUI, 5视图模式)
-│   ├── test_syscall.c                   # 最小验证程序 (测试3个系统调用)
-│   └── Makefile                         # 用户态编译脚本
-├── user_app_bubbletea/
-│   ├── go.mod                           # Go 模块定义
-│   └── main.go                          # Go Bubble Tea TUI 监控程序
-├── .gitignore
-├── README.md                            # 本文件 (项目概览)
-└── principles.md                        # 原理与实现完整说明 (内核+用户态)
+│   ├── proc_monitor.h             # 用户态头文件
+│   ├── proc_monitor.c             # ncurses TUI 主程序
+│   ├── test_syscall.c             # 系统调用验证程序
+│   └── Makefile
+├── README.md
+└── principles.md                  # 详细原理与实现文档
 ```
 
 ---
 
 ## 快速开始
 
-### 1. 内核侧：修改、编译、安装
+### 内核侧
+
+将文件放入内核源码树，注册系统调用号，编译安装：
 
 ```bash
-# (1) 将本仓库文件放入 Linux 6.18 内核源码树
-#     假设内核源码在 ~/linux-6.18/
-
-cp OScoursework/include/linux/proc_monitor.h  ~/linux-6.18/include/linux/
-cp OScoursework/kernel/proc_monitor.c         ~/linux-6.18/kernel/
-
-# (2) 修改 kernel/Makefile
+cp include/linux/proc_monitor.h  ~/linux-6.18/include/linux/
+cp kernel/proc_monitor.c         ~/linux-6.18/kernel/
 echo "obj-y += proc_monitor.o" >> ~/linux-6.18/kernel/Makefile
 
-# (3) 注册系统调用号
-#     编辑 ~/linux-6.18/arch/x86/entry/syscalls/syscall_64.tbl
-#     在末尾添加:
-#       470  common  proc_collect   sys_proc_collect
-#       471  common  proc_snapshot  sys_proc_snapshot
-#       472  common  proc_stat      sys_proc_stat
+# 编辑 arch/x86/entry/syscalls/syscall_64.tbl，末尾添加:
+#   470  common  proc_collect   sys_proc_collect
+#   471  common  proc_snapshot  sys_proc_snapshot
+#   472  common  proc_stat      sys_proc_stat
 
-# (4) 编译内核 (推荐 localmodconfig，只编译用到的模块，5-15 分钟)
 cd ~/linux-6.18
-make localmodconfig
-make -j$(nproc)
-make modules -j$(nproc)
-
-# (5) 安装并重启
-sudo make modules_install
-sudo make install
-sudo update-grub
-sudo reboot
+make localmodconfig && make -j$(nproc) && make modules -j$(nproc)
+sudo make modules_install && sudo make install
+sudo update-grub && sudo reboot
 ```
 
-### 2. 用户态：编译、验证、运行
+### 用户态
 
 ```bash
-# 安装依赖 (ncurses 开发库)
 sudo apt install libncurses-dev
-
-cd OScoursework/user_app
-
-# 编译
+cd user_app
 make
-
-# 验证系统调用可用
-make test
-
-# 运行 ncurses 调试版监控程序 (需要 root 权限才能调用自定义 syscall)
+make test        # 验证系统调用
 sudo ./proc_monitor
 ```
 
-### 3. Go TUI 版 (纯标准库)
+---
 
-Go 语言版本，零外部依赖 (仅 Go 标准库)，纯 ANSI 终端渲染：
+## 关键设计
 
-```bash
-# 安装 Go 1.21+ (如未安装)
-sudo apt install golang-go   # Ubuntu
-# 或从 https://go.dev/dl/ 下载
+**为什么定义独立的数据结构**:
+`task_struct` 包含数百个字段和内核内部状态。直接暴露会导致安全风险（泄露内核地址）、
+兼容性问题（内核升级破坏用户态）。因此定义 `proc_info` / `proc_tree_node` / `proc_stat`
+作为内核与用户态之间的数据格式约定，两边头文件逐字节一致。
 
-cd OScoursework/user_app_bubbletea
+**为什么必须用 `copy_to_user()`**:
+内核和用户态的地址空间隔离。不能把内核指针传给用户态（段错误），也不能在内核态直接
+解引用用户态指针（SMAP 硬件保护）。`copy_to_user()` 是唯一安全通道：它执行地址合法性
+检查、临时关闭 SMAP、处理缺页异常。
 
-# 下载依赖并编译
-go mod tidy
-go build -o procmon .
+**锁策略**:
+进程链表由 RCU 和 `tasklist_lock` 保护。关键约束——RCU 读者不能睡眠，而 `copy_to_user()`
+可能因缺页触发磁盘 I/O 而睡眠。因此必须采用 lock-drop-copy-relock 模式：持锁读取数据
+并保存 `next_task()` 指针，释放锁后调用 `copy_to_user()`，再重新加锁用保存的指针继续遍历。
 
-# 运行
-sudo ./procmon
-```
-
-**Go TUI 版功能：**
-
-| 功能 | 按键 | 说明 |
-|:---|:---|:---|
-| 实时刷新 | (自动) | 每秒自动刷新，状态栏实时更新 |
-| 过滤 | `/` | 输入过滤条件后 Enter 确认 |
-| 清除过滤 | `Esc` | |
-| 排序切换 | `s` | PID → CPU → MEM → NAME 循环 |
-| 排序方向 | `S` | 升序/降序切换 |
-| 进程树 | `t` | 切换列表/树视图，Unicode 缩进线 |
-| 滚动 | `↑↓` / `j k` | 逐行滚动 |
-| 翻页 | `PgUp` / `PgDn` | |
-| 跳转 | `g`=顶部 `G`=底部 | |
-| 帮助 | `?` | |
-
-**过滤语法：**
-
-| 输入 | 含义 |
-|:---|:---|
-| `systemd` | 进程名包含 "systemd" (忽略大小写) |
-| `=R` | 状态为 Running |
-| `=Z` | 状态为 Zombie |
-| `:1234` | PID 等于 1234 |
+**状态编码**:
+Linux 5.14+ 将进程状态拆分为 `task->__state`（调度状态）和 `task->exit_state`（退出状态）。
+内核通过 `state = __state | exit_state` 合并传递。`__state` 可能带有标志位
+（TASK_WAKEKILL=0x80, TASK_NOLOAD=0x400），分类时必须先用位掩码清除标志位，不能用精确值匹配。
 
 ---
 
-## 实现依据：Linux 内核文档与 API 参考
+## 内核 API 参考
 
-本节记录每个内核接口、数据结构、同步机制在 Linux 6.18 官方文档中的出处。
+本项目使用的 Linux 内核函数：
 
-### 1. 系统调用注册机制
+- `SYSCALL_DEFINEn()` (`<linux/syscalls.h>`) — 定义系统调用入口
+- `for_each_process()`, `next_task()`, `get_task_comm()`, `task_tgid_nr()`, `task_nice()` (`<linux/sched.h>`) — 进程遍历与字段读取
+- `read_lock()`, `read_unlock()` — tasklist_lock 读写锁
+- `task_cputime()` (`<linux/sched/cputime.h>`) — 读取 CPU 时间（纳秒）
+- `nsec_to_clock_t()` (`<linux/jiffies.h>`) — 纳秒转换为 USER_HZ 滴答
+- `get_mm_rss()`, `PAGE_SHIFT` (`<linux/mm.h>`) — 读取内存信息
+- `from_kuid_munged()` (`<linux/cred.h>`) — UID 命名空间映射
+- `copy_to_user()` (`<linux/uaccess.h>`) — 内核到用户态数据拷贝
 
-依据：**`Documentation/process/adding-syscalls.rst`**
-
-| 实现要点                              | 内核文档要求                                                                            | 对应代码                                  |
-| :-------------------------------- | :-------------------------------------------------------------------------------- | :------------------------------------ |
-| 使用 `SYSCALL_DEFINEn()` 宏          | L200-204: *"add this entry point with the appropriate `SYSCALL_DEFINEn()` macro"* | `kernel/proc_monitor.c` L48/168/223   |
-| x86_64 系统调用表注册                    | L300-309: *"a 'common' entry in `syscall_64.tbl`: `333 common xyzzy sys_xyzzy`"*  | `syscall_64.tbl.patch`                |
-| 在 `include/linux/syscalls.h` 添加原型 | L207-211: *"a corresponding function prototype, marked as asmlinkage"*            | 待补充                                   |
-| 在 `kernel/sys_ni.c` 添加回退桩         | L225-229: *"Add your new system call here too: `COND_SYSCALL(xyzzy);`"*           | 待补充                                   |
-| 设计可扩展的数据结构                        | L83-103: 推荐用结构体封装参数，含 `size` 字段支持未来扩展                                             | `proc_info` 等结构体经 `copy_to_user()` 传递 |
-
-### 2. 进程链表遍历与 RCU 同步
-
-依据：**`Documentation/RCU/listRCU.rst`**
-
-| 实现要点 | 内核文档 | 对应代码 |
-|:---|:---|:---|
-| `for_each_process()` 基于 RCU 链表 | L29-36: `next_task(p)` → `list_entry_rcu(p->tasks.next, ...)` | `kernel/proc_monitor.c` L63/182/236 |
-| 读者应使用 `rcu_read_lock()` | L40-44: `rcu_read_lock(); for_each_process(p) { ... } rcu_read_unlock();` | 当前使用 `read_lock(&tasklist_lock)`，待优化 |
-| 写者使用 `write_lock(&tasklist_lock)` | L51-53: `write_lock(&tasklist_lock); list_del_rcu(...);` | 内核进程创建/销毁时自动处理 |
-| RCU 宽限期保证遍历安全 | L53-68: *"deferring of destruction ensures that any readers ... will see valid pointers"* | 保证遍历中读取的 `task_struct*` 字段有效 |
-| RCU 读者不可睡眠 | `Documentation/RCU/rcu.rst` L32-34: *"RCU readers are not permitted to block, switch to user-mode, or enter the idle loop"* | 因此 `copy_to_user()` 必须在释放锁之后调用 |
-
-### 3. 进程状态编码
-
-依据：**`include/linux/sched.h`**（内核头文件，Linux 6.x）
-
-Linux 5.14+ 将 `task_struct` 的 `state` 重命名为 **`__state`**，并引入 `TASK_REPORT` 掩码。
-退出状态（`EXIT_ZOMBIE`、`EXIT_DEAD`）存于独立的 **`task->exit_state`** 字段，不在 `__state` 中。
-
-| 字段 | 含义 | 典型值 |
-|:---|:---|:---|
-| `task->__state` | 当前调度状态 | `TASK_RUNNING=0`, `TASK_INTERRUPTIBLE=1`, `TASK_UNINTERRUPTIBLE=2`, `TASK_STOPPED`, `TASK_TRACED` |
-| `task->exit_state` | 进程退出状态 | `EXIT_ZOMBIE=0x10`, `EXIT_DEAD=0x20` |
-
-> **注意**：当前 `sys_proc_stat` 在 `switch(task->__state)` 中检测 `EXIT_ZOMBIE`/`EXIT_DEAD`，
-> 这两个值实际在 `exit_state` 中，`__state` 永远不包含它们。需修复（见审查报告 Issue 1）。
-
-### 4. CPU 时间采集
-
-依据：**`include/linux/sched/cputime.h`** + `include/linux/jiffies.h`
-
-发行版内核（`CONFIG_VIRT_CPU_ACCOUNTING_GEN=y`）将 CPU 时间以**纳秒**精度存储在 `task_struct` 中。
-直接读 `task->utime` 会得到纳秒值（如 56280000000），而非 jiffies。
-
-| API | 说明 | 代码位置 |
-|:---|:---|:---|
-| `task_cputime(task, &ut_ns, &st_ns)` | 以纳秒精度读取 CPU 时间 | `proc_monitor.c` L83-84 |
-| `nsec_to_clock_t(ns)` | 纳秒 → `USER_HZ` 时钟滴答（= `sysconf(_SC_CLK_TCK)`） | `proc_monitor.c` L85-86 |
-
-依据：**`Documentation/filesystems/proc.rst`** Table 1-4（L338-339）：
-> *"utime — user mode jiffies; stime — kernel mode jiffies"*
-
-本实现输出的 `utime` / `stime` 是 **USER_HZ 时钟滴答（jiffies）**，与 `/proc/pid/stat` 语义一致。
-
-### 5. 内存信息采集
-
-依据：**`Documentation/filesystems/proc.rst`** Table 1-4（L347-348）：
-> *"vsize — virtual memory size; rss — resident set memory size"*
-
-| API | 说明 | 代码位置 |
-|:---|:---|:---|
-| `task->mm->total_vm << PAGE_SHIFT` | 虚拟内存大小（页数 → 字节） | `proc_monitor.c` L91 |
-| `get_mm_rss(task->mm)` | 常驻内存集，返回页数 | `proc_monitor.c` L92 |
-
-依据：**`Documentation/mm/active_mm.rst`**（L44-46）：
-> *"tsk->mm points to the 'real address space'. For an anonymous process, tsk->mm will be NULL."*
-
-内核线程（`[kthreadd]`、`[ksoftirqd]` 等）`mm == NULL`，无用户态地址空间，`vsize`/`rss` 填 0。
-
-### 6. 用户身份映射
-
-| API | 说明 | 文档来源 |
-|:---|:---|:---|
-| `get_task_comm(kinfo.comm, task)` | 安全复制进程名（最多 `TASK_COMM_LEN-1` 字符） | `include/linux/sched.h` |
-| `task_tgid_nr(task)` | 获取线程组 ID，即用户态视角的 PID | `include/linux/sched.h` |
-| `task_nice(task)` | 获取 nice 优先级（-20 ~ 19） | `include/linux/sched.h` |
-| `from_kuid_munged(current_user_ns(), task_uid(task))` | 将内核 UID 映射到调用者的用户命名空间 | `include/linux/cred.h` |
-| `copy_to_user()` | 内核→用户态数据传递的唯一安全方式 | `adding-syscalls.rst` 隐含要求：所有 `__user` 指针必须经此函数 |
-
-### 7. 安全与权限
-
-依据：**`Documentation/process/adding-syscalls.rst`** L166-167：
-> *"If your new syscall manipulates a process other than the calling process, it should be restricted (using a call to `ptrace_may_access()`)"*
-
-当前实现无权限检查，任何用户可查看全部进程信息。若需限制访问，应添加 `capable(CAP_SYS_PTRACE)` 或 `ptrace_may_access()`。
-
-### 8. 头文件依赖对照表
-
-`kernel/proc_monitor.c` 的 `#include` 及各自提供的 API：
-
-| 头文件 | 提供的 API |
-|:---|:---|
-| `<linux/syscalls.h>` | `SYSCALL_DEFINEn()` 宏 |
-| `<linux/sched.h>` | `task_struct`, `for_each_process()`, `get_task_comm()`, `task_tgid_nr()`, `task_nice()` |
-| `<linux/sched/signal.h>` | `task->signal->nr_threads` |
-| `<linux/sched/cputime.h>` | `task_cputime()` |
-| `<linux/jiffies.h>` | `nsec_to_clock_t()` |
-| `<linux/uaccess.h>` | `copy_to_user()` |
-| `<linux/cred.h>` | `from_kuid_munged()`, `current_user_ns()`, `task_uid()` |
-| `<linux/mm.h>` | `get_mm_rss()`, `PAGE_SHIFT` |
-| `<linux/proc_monitor.h>` | 本项目自定义的共享数据结构 |
+本项目自实现的函数：
+- 内核侧：`sys_proc_collect()` (470), `sys_proc_snapshot()` (471), `sys_proc_stat()` (472), `compute_level()`
+- 用户态：`fetch_procs()`, `update_data()`, `cpu_pct()`, `state_decode()`, 排序/过滤/渲染/导出函数
 
 ---
 
-## 核心设计决策
+## 相关文档
 
-### 为什么设计专门的数据结构？
-
-内核的 `task_struct` 包含数百个字段和大量内部状态，直接暴露给用户态会导致：
-- **安全风险**：泄露内核地址布局和内部状态
-- **兼容性问题**：内核版本升级后结构体变化导致所有用户态程序崩溃
-- **复杂性**：用户态不需要知道内核的全部实现细节
-
-因此我们定义了扁平化的 `proc_info` / `proc_tree_node` / `proc_stat` 结构体作为**数据契约**。
-
-### 为什么必须用 `copy_to_user()`？
-
-内核空间和用户空间的虚拟地址是隔离的。直接把内核指针 (`task_struct*`) 传给用户态会导致 **段错误 (Segmentation Fault)**。`copy_to_user()` 是内核向用户态传递数据的**唯一合法方式**，它执行：
-1. 地址合法性检查
-2. 权限验证
-3. 缺页异常处理
-
-### 用户态为什么必须用 `syscall()`？
-
-这是实验的**核心要求** — 禁止使用 `/proc`、`ps`、`eBPF`、`ptrace` 等旁路。`syscall()` 直接触发 `syscall` 指令陷入内核，本质上是**重写了一个极简版的 `/proc` 数据采集机制**。
-
----
-
-## 技术要点
-
-| 要点 | 说明 | 文档依据 |
-|:---|:---|:---|
-| 锁机制 | 持锁保存 `next_task()` 指针 → 释放锁 `copy_to_user` → 用保存的指针继续遍历，杜绝 UAF | `RCU/listRCU.rst` |
-| 锁释放时机 | `copy_to_user()` 可能睡眠，必须释放锁后调用 | `RCU/rcu.rst` — RCU 读者不可阻塞 |
-| 内核线程处理 | `mm==NULL` 的内核线程无用户态内存，vsize/rss 填 0 | `mm/active_mm.rst` L44-46 |
-| 状态编码 | Linux 5.14+：`__state` 存调度状态，`exit_state` 存退出状态 (ZOMBIE/DEAD)；内核报告 `__state \| exit_state` | `include/linux/sched.h` |
-| 逐个拷贝 | 每个条目单独 `copy_to_user()`，避免内核栈分配过大数组 | `adding-syscalls.rst` 安全要求 |
-| CPU 时间 | `task_cputime()` + `nsec_to_clock_t()` → USER_HZ 滴答 | `sched/cputime.h` + `proc.rst` L338-339 |
-| 内存信息 | `total_vm << PAGE_SHIFT` (字节) + `get_mm_rss()` (页数) | `proc.rst` L347-348 |
-
----
-
-## 相关资源
-
-- [Linux Kernel 6.18](https://kernel.org/)
-- [Linux 内核源码在线](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git)
-- 详细设计文档: 参见仓库同级的 [`principles.md`](principles.md) — 完整原理与实现说明
-- 原始设计计划: 参见仓库同级的 `plan.md`
-
-### 本项目引用的内核文档
-
-| 文档 | 路径 | 内容 |
-|:---|:---|:---|
-| 添加系统调用规范 | `Documentation/process/adding-syscalls.rst` | `SYSCALL_DEFINEn`, syscall 表注册, `copy_to_user`, 原型声明, `COND_SYSCALL` |
-| RCU 链表遍历 | `Documentation/RCU/listRCU.rst` | `for_each_process()`, `rcu_read_lock`, RCU 宽限期, 进程链表 |
-| RCU 基本概念 | `Documentation/RCU/rcu.rst` | RCU 读者不可阻塞/切换上下文/进入空闲 |
-| /proc 文件系统 | `Documentation/filesystems/proc.rst` | `/proc/pid/stat` 字段定义 (utime/stime/vsize/rss/nice/num_threads) |
-| Active MM | `Documentation/mm/active_mm.rst` | `task->mm == NULL` 内核线程语义 |
+- Linux 内核: `Documentation/process/adding-syscalls.rst` — 系统调用注册规范
+- Linux 内核: `Documentation/RCU/listRCU.rst` — RCU 链表遍历
+- Linux 内核: `Documentation/filesystems/proc.rst` — `/proc/pid/stat` 字段定义
+- Linux 内核: `Documentation/mm/active_mm.rst` — 内核线程 (`mm==NULL`) 语义
+- 本项目: [`principles.md`](principles.md) — 完整原理说明、内存布局、调试指南、bug 记录
 
 ---
 
 ## 作者
 
 Arch1mboldi · 2026年春季操作系统课程设计
-
----
-
-🤖 本 README 部分内容由 Claude Code 辅助生成
