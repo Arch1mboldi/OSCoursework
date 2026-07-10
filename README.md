@@ -105,7 +105,8 @@ OSCoursework/
 │   ├── go.mod                           # Go 模块定义
 │   └── main.go                          # Go Bubble Tea TUI 监控程序
 ├── .gitignore
-└── README.md                            # 本文件
+├── README.md                            # 本文件 (项目概览)
+└── principles.md                        # 原理与实现完整说明 (内核+用户态)
 ```
 
 ---
@@ -359,7 +360,8 @@ Linux 5.14+ 将 `task_struct` 的 `state` 重命名为 **`__state`**，并引入
 
 - [Linux Kernel 6.18](https://kernel.org/)
 - [Linux 内核源码在线](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git)
-- 详细设计文档: 参见仓库同级的 `plan.md`
+- 详细设计文档: 参见仓库同级的 [`principles.md`](principles.md) — 完整原理与实现说明
+- 原始设计计划: 参见仓库同级的 `plan.md`
 
 ### 本项目引用的内核文档
 
