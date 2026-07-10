@@ -37,6 +37,15 @@
    - [6.9 交叉验证](#69-交叉验证)
 7. [编译与部署](#7-编译与部署)
 8. [调试指南](#8-调试指南)
+9. [深入：一次系统调用的内核之旅 (Syscall Deep Dive)](#9-深入一次系统调用的内核之旅-syscall-deep-dive)
+   - [9.1 前置概念速查](#91-前置概念速查)
+   - [9.2 CPU 视角：从 Ring 3 到 Ring 0](#92-cpu-视角从-ring-3-到-ring-0)
+   - [9.3 内存视角：关键数据结构布局](#93-内存视角关键数据结构布局)
+   - [9.4 锁机制详解：RCU + tasklist_lock](#94-锁机制详解rcu--tasklist_lock)
+   - [9.5 copy_to_user() 内部机制](#95-copy_to_user-内部机制)
+   - [9.6 完整执行轨迹：sys_proc_collect (470)](#96-完整执行轨迹sys_proc_collect-470)
+   - [9.7 三个系统调用的差异对比](#97-三个系统调用的差异对比)
+   - [9.8 关键指针与内存安全](#98-关键指针与内存安全)
 附录 A. [内核状态位参考](#附录-a-内核状态位参考)
 附录 B. [proc_info 字段与 /proc/pid/stat 对照](#附录-b-proc_info-字段与-procpidstat-对照)
 附录 C. [Bugs Fixed & Lessons Learned](#附录-c-bugs-fixed--lessons-learned)
@@ -548,13 +557,13 @@ CPU% = 进程在两次采集之间消耗的 CPU 时间 / 实际经过的 wall-cl
 
 ### 6.5 五视图模式
 
-| 模式 | 编号 | 用途 | 数据来源 |
-|:---|:---|:---|:---|
-| **LIST** | 1 | 紧凑表格, 含 state hex 原始值, CPU%, 11 字段 | proc_info |
-| **DEBUG-TABLE** | 2 | 所有字段原始数值, 不做任何格式化 | proc_info |
-| **TREE** | 3 | 进程树层次结构, Unicode 树线, 按深度着色 | proc_tree_node |
-| **HEX-DUMP** | 4 | 选中进程 proc_info 的原始字节 + 字段偏移标注 | proc_info (raw bytes) |
-| **SYSCALL** | 5 | 系统调用诊断: ret/errno/latency/struct 大小/cross-validation | sc_result + proc_stat |
+| 模式              | 编号  | 用途                                                   | 数据来源                  |
+| :-------------- | :-- | :--------------------------------------------------- | :-------------------- |
+| **LIST**        | 1   | 紧凑表格, 含 state hex 原始值, CPU%, 11 字段                   | proc_info             |
+| **DEBUG-TABLE** | 2   | 所有字段原始数值, 不做任何格式化                                    | proc_info             |
+| **TREE**        | 3   | 进程树层次结构, Unicode 树线, 按深度着色                           | proc_tree_node        |
+| **HEX-DUMP**    | 4   | 选中进程 proc_info 的原始字节 + 字段偏移标注                        | proc_info (raw bytes) |
+| **SYSCALL**     | 5   | 系统调用诊断: ret/errno/latency/struct 大小/cross-validation | sc_result + proc_stat |
 
 **LIST 视图列**:
 ```
@@ -587,12 +596,13 @@ Field Map:
 
 过滤语法（在 `/` 键进入的过滤模式下输入）：
 
-| 语法 | 含义 | 实现 |
-|:---|:---|:---|
-| `bash` | 进程名包含 "bash" (大小写不敏感) | `strstr(lower(name), lower(filter))` |
-| `=R` | state 字符匹配 (R/S/D/T/Z/X/t) | `state_char(p->state) == filter[1]` |
-| `=0x22` | state 位掩码精确匹配 (调试用) | `p->state == strtol("=0x22", NULL, 16)` |
-| `:1234` | PID 精确匹配 | `p->pid == atoi(":1234")` |
+| 语法      | 含义                         | 实现                                      |
+| :------ | :------------------------- | :-------------------------------------- |
+| `bash`  | 进程名包含 "bash" (大小写不敏感)      | `strstr(lower(name), lower(filter))`    |
+| `=R`    | state 字符匹配 (R/S/D/T/Z/X/t) | `state_char(p->state) == filter[1]`     |
+| `=0x22` | state 位掩码精确匹配 (调试用)        | `p->state == strtol("=0x22", NULL, 16)` |
+| `:1234` | PID 精确匹配                   | `p->pid == atoi(":1234")`               |
+|         |                            |                                         |
 
 过滤模式下 `filtered_count()` 和 `filtered_index(n)` 用于统计过滤后数量和定位第 n 个可见条目。
 
@@ -745,6 +755,576 @@ xxd proc_dump.bin | head -20
 1. `sys_proc_stat` 的分类逻辑有 bug（如 `__state` vs `exit_state` 混淆）
 2. 两次 syscall 之间的时间窗口过大（检查 latency 值）
 3. `MAX_PROCS` 不够大，部分进程被截断
+
+---
+
+## 9. 深入：一次系统调用的内核之旅 (Syscall Deep Dive)
+
+> 本章将 §4-§5 中分散的概念串联起来，以 `sys_proc_collect(470)` 为主线，
+> 从 CPU、内存、锁三个视角追踪一次系统调用的完整执行过程。
+
+### 9.1 前置概念速查
+
+在开始追踪之前，快速回顾涉及的每个内核概念：
+
+| 概念 | 一句话定义 | 详见 |
+|:---|:---|:---|
+| **用户态 (Ring 3)** | CPU 的低权限模式，不能执行特权指令，不能直接访问内核内存 | x86_64 保护模式 |
+| **内核态 (Ring 0)** | CPU 的高权限模式，可访问所有内存和硬件，执行特权指令 | x86_64 保护模式 |
+| **`syscall` 指令** | x86_64 专用指令，原子地完成：Ring 3→Ring 0、保存 RIP/RFLAGS、跳转到内核入口 | `entry_SYSCALL_64` |
+| **MSR (Model-Specific Register)** | CPU 配置寄存器。`MSR_LSTAR` 存内核入口地址，`MSR_GS_BASE` 存 per-CPU 数据基址 | x86_64 ABR |
+| **内核栈** | 每个任务在内核态使用的独立栈（通常 16KB，`task_struct->stack`），与用户态栈分离 | `thread_union` |
+| **`task_struct`** | 内核描述一个进程/线程的结构体（~7KB），含 PID、state、mm、tasks 链表节点等 | `include/linux/sched.h` |
+| **`tasklist_lock`** | 保护进程链表 (`task_struct->tasks`) 的读写自旋锁，读者用 `read_lock()` | [§5.1](#51-锁策略lock-drop-copy-relock) |
+| **RCU (Read-Copy-Update)** | 一种"读写不对称"的同步机制：读者几乎零开销，写者延迟回收旧数据。进程链表 RCU 保护 | `Documentation/RCU` |
+| **`copy_to_user()`** | 内核函数，将内核数据安全拷贝到用户态地址空间，包含权限检查和缺页处理 | [§9.5](#95-copy_to_user-内部机制) |
+| **SMAP (Supervisor Mode Access Prevention)** | x86 硬件特性：Ring 0 默认**禁止**访问用户态页。必须用 `stac` 指令临时放行 | CR4.SMAP 位 |
+| **UAF (Use-After-Free)** | 访问已释放内存的 bug。本项目通过保存 `next_task()` 指针避免 UAF | [§5.1](#51-锁策略lock-drop-copy-relock) |
+
+### 9.2 CPU 视角：从 Ring 3 到 Ring 0
+
+当用户程序调用 `syscall(SYS_proc_collect, buf, max_count, &count)` 时，CPU 执行以下步骤：
+
+**第 1 步 — glibc 封装**
+
+```c
+// glibc 的 syscall() 函数将参数放入寄存器，执行 syscall 指令
+// x86_64 调用约定 (System V AMD64 ABI, Appendix A):
+//   rax = 系统调用号 (470 = 0x1D6)
+//   rdi = 第1个参数 (user_buf)
+//   rsi = 第2个参数 (max_count)
+//   rdx = 第3个参数 (ret_count)
+```
+
+```asm
+mov    $470, %rax        # 系统调用号 → rax
+mov    %rdi, %r10        # 第4参数用 r10 (syscall 指令会破坏 rcx)
+syscall                  # ─── 从这里开始进入内核 ───
+```
+
+**第 2 步 — CPU 硬件动作 (`syscall` 指令)**
+
+`syscall` 是一条**原子**指令，CPU 硬件在同一时钟周期内完成：
+
+```
+1. RCX ← RIP_next          (保存用户态返回地址)
+2. R11 ← RFLAGS            (保存用户态标志寄存器)
+3. CS  ← MSR_STAR[47:32]   (加载内核代码段选择子 → Ring 0)
+4. SS  ← MSR_STAR[47:32]+8 (加载内核栈段选择子)
+5. RIP ← MSR_LSTAR         (跳转到 entry_SYSCALL_64)
+6. CPL ← 0                 (切换到 Ring 0)
+```
+
+关键 MSR 值（内核启动时设置）：
+
+| MSR | 存储内容 | 本项目中对应的值 |
+|:---|:---|:---|
+| `MSR_LSTAR` (0xC0000082) | 系统调用入口地址 | `entry_SYSCALL_64` 的虚拟地址 |
+| `MSR_STAR` (0xC0000081) | 用户/内核段选择子 | `__USER32_CS`, `__KERNEL_CS` 等 |
+| `MSR_GS_BASE` (0xC0000101) | per-CPU 数据区基址 | 指向当前 CPU 的 `struct tss_struct` 等 |
+
+**第 3 步 — 内核入口 `entry_SYSCALL_64`**
+
+内核在 `arch/x86/entry/entry_64.S` 中定义入口：
+
+```asm
+entry_SYSCALL_64:
+    swapgs                      # ① 交换 GS 基址: 用户GS↔内核GS
+    mov    %rsp, PER_CPU(cpu_tss_rw + TSS_sp2)  # ② 保存用户栈指针
+    mov    PER_CPU(cpu_top_of_stack), %rsp      # ③ 切换到内核栈
+    pushq  $__USER_DS           # ④ 构造 pt_regs 帧
+    pushq  PER_CPU(cpu_tss_rw + TSS_sp2)        #    (保存用户 SS)
+    pushq  %r11                 #    (保存用户 RFLAGS)
+    pushq  $__USER_CS           #    (保存用户 CS)
+    pushq  %rcx                 #    (保存用户 RIP)
+    pushq  %rax                 #    (保存 RAX=470, 也用作返回值)
+    ... (保存其余寄存器) ...
+    mov    %rsp, %rdi           # ⑤ rdi = pt_regs 指针 (传给 do_syscall_64)
+    call   do_syscall_64        # ⑥ 进入 C 代码
+```
+
+此时 CPU 状态：
+
+```
+Ring:     0 (内核态)
+RSP:      指向内核栈上的 pt_regs 帧
+RAX:      470 (系统调用号)
+RDI:      user_buf   (来自用户态的 proc_info* 指针)
+RSI:      max_count  (来自用户态的 int)
+RDX:      ret_count  (来自用户态的 int*)
+GS_BASE:  per-CPU 内核数据结构
+```
+
+**第 4 步 — `do_syscall_64()` 分发**
+
+```c
+// arch/x86/entry/common.c (简化)
+__visible void do_syscall_64(struct pt_regs *regs) {
+    long nr = regs->ax;                        // 系统调用号 = 470
+    if (nr < NR_syscalls) {
+        sys_call_ptr_t fn = sys_call_table[nr]; // fn = sys_proc_collect
+        regs->ax = fn(regs);                    // 调用实际处理函数
+    }
+}
+```
+
+`sys_call_table[470]` 在编译时由 `SYSCALL_DEFINE3(proc_collect, ...)` 宏填充——宏展开时自动生成 `sys_proc_collect` 并将函数指针填入表项。
+
+### 9.3 内存视角：关键数据结构布局
+
+当 `copy_to_user()` 执行时，以下是各数据结构在地址空间中的位置：
+
+```
+                    x86_64 虚拟地址空间 (48-bit)
+    ┌────────────────────────────────────────────────────────────┐
+    │                    用户态 (Ring 3)                          │
+    │                                                            │
+    │  proc_monitor 进程虚拟地址空间:                              │
+    │  ┌──────────────────────────┐                               │
+    │  │ [stack]                  │ ← 用户态栈 (RSP_usr)          │
+    │  │ ...                      │                               │
+    │  │ g_procs[MAX_PROCS]       │ ← .bss 段，~640KB             │
+    │  │   = buf[] (proc_info*)   │   syscall 参数 rdi 指向这里    │
+    │  │ ...                      │                               │
+    │  │ &count (int*)            │ ← syscall 参数 rdx 指向这里    │
+    │  └──────────────────────────┘                               │
+    │                                                            │
+    ├────────────────── syscall boundary ─────────────────────────┤
+    │                                                            │
+    │                    内核态 (Ring 0)                           │
+    │                                                            │
+    │  ┌──────────────────────────┐                               │
+    │  │ [kernel stack]           │ ← task_struct->stack (16KB)   │
+    │  │   pt_regs frame (~1KB)   │   entry_SYSCALL_64 压入       │
+    │  │   local variables:       │                               │
+    │  │     kinfo (80B)          │ ← 内核栈上的临时 proc_info     │
+    │  │     next (*task_struct)  │ ← 保存的下一个 task 指针       │
+    │  │     count (int)          │                               │
+    │  │   ...                    │                               │
+    │  ├──────────────────────────┤                               │
+    │  │ direct mapping           │ ← 所有物理内存的 1:1 映射      │
+    │  │ (0xffff888000000000+)    │   物理地址 N → 虚拟地址 N+基址 │
+    │  │                          │                               │
+    │  │  task_struct (PID=1)     │ ← 内核堆 (kmalloc-* 分配)     │
+    │  │    ├─ tasks.next ────────┼──→ task_struct (PID=2)        │
+    │  │    ├─ mm*                │                               │
+    │  │    ├─ __state            │                               │
+    │  │    ├─ utime, stime       │                               │
+    │  │    └─ ...                │                               │
+    │  │                          │                               │
+    │  │  task_struct (PID=2)     │                               │
+    │  │    ├─ tasks.next ────────┼──→ task_struct (PID=3)        │
+    │  │    └─ ...                │                               │
+    │  │                          │                               │
+    │  │  ... (共 381 个节点)     │                               │
+    │  │                          │                               │
+    │  │  init_task               │ ← 链表哨兵 (静态分配)          │
+    │  └──────────────────────────┘                               │
+    └────────────────────────────────────────────────────────────┘
+```
+
+关键观察：
+
+1. **用户态 `buf` 和内核 `kinfo` 在不同的地址空间**：`buf` 在用户态低地址（如 `0x7fff...`），`kinfo` 在内核栈高地址（如 `0xffffc900...`）。`copy_to_user()` 跨越这个边界。
+2. **`task_struct` 在内核 direct mapping 区域**：地址形如 `0xffff8880...`，内核代码可以直接解引用（Ring 0 权限）。
+3. **内核栈很小（16KB）**：这也是为什么不分配 `proc_info[8192]` 大数组在栈上——80B × 8192 = 640KB，远超 16KB。所以我们逐个拷贝。
+
+### 9.4 锁机制详解：RCU + tasklist_lock
+
+#### 为什么用 RCU
+
+进程链表 (`task_struct->tasks`) 是典型的 **read-mostly** 数据结构：
+- 读者极频繁：`ps`, `top`, `/proc` 每时每刻在遍历
+- 写者极稀少：只有 `fork()` / `exit()` 时修改
+
+RCU 优化读者——读者几乎零同步开销。写者则需等待"宽限期"后释放旧版本。
+
+#### `read_lock(&tasklist_lock)` 内部
+
+```c
+// 简化：在 x86_64 上等价于
+preempt_disable();           // 禁止内核抢占
+atomic_inc(&lock->readers);  // 读者计数 +1
+// 此时写者必须等待 readers 降为 0 才能获取写锁
+```
+
+`preempt_disable()` 是关键——读者不能被调度走，因为：
+- 如果读者被抢占后睡眠 1 秒，写者必须等待 1 秒
+- RCU 宽限期依赖"所有 CPU 都经历一次调度"——被禁抢占的 CPU 不会调度
+
+#### 为什么 RCU 读者不能睡眠
+
+```
+假设读者持锁时睡眠:
+  read_lock(&tasklist_lock);
+  ... 睡眠 (等待 I/O) ...
+  [其他 CPU 上的写者调用 write_lock(&tasklist_lock) — 死等!]
+  ... 1秒, 2秒, 10秒 ...
+  [系统基本卡死]
+```
+
+`copy_to_user()` 可能因缺页触发 I/O → 睡眠。这就是 **lock-drop-copy-relock** 模式的必要性。
+
+#### Lock-Drop-Copy-Relock 逐步推演
+
+以遍历 381 个进程中的第 N 个为例：
+
+```
+时刻 T0: read_lock(&tasklist_lock);
+          ┌────── 当前: 持锁, task = PID_N ──────┐
+          │                                        │
+          │  kinfo.pid  = task->pid;    // 读字段   │
+          │  kinfo.state = task->__state |          │
+          │                task->exit_state;        │
+          │  kinfo.utime = nsec_to_clock_t(...);    │
+          │  ... (读其余字段) ...                   │
+          │                                        │
+T1:       │  next = next_task(task);   // 保存后继!  │
+          │  // 关键: 此刻 task 和 next 都有效       │
+          │  // 因为持锁, RCU 保证两者不过期         │
+          └────────────────────────────────────────┘
+T2:       read_unlock(&tasklist_lock);
+          ┌────── 当前: 无锁 ──────────────────┐
+          │                                     │
+          │  // 危险期: task 可能被 free        │
+          │  // 因为 exit() → RCU 回收!         │
+          │  // 但 next 仍有效 (未退出或        │
+          │  // RCU 宽限期未过)                  │
+          │                                     │
+T3:       │  copy_to_user(&buf[N], &kinfo, 80); │
+          │  // 可能缺页 → 换入 swap → 睡眠     │
+          │  // 睡眠安全: 因为我们没持锁!        │
+          │  // 醒来后 kinfo (栈上) 仍然有效     │
+          └─────────────────────────────────────┘
+T4:       read_lock(&tasklist_lock);
+          ┌────── 当前: 重新持锁 ──────────┐
+          │                                 │
+          │  task = next;  // 用保存的指针   │
+          │  // 绝不: task = task->tasks.next│
+          │  // 因为原 task 可能已被 free!   │
+          │  count++;                       │
+          └─────────────────────────────────┘
+T5:       // 下一轮循环: task = PID_{N+1}
+```
+
+**为什么 `next = next_task(task)` 安全，`task->tasks.next` 不安全？**
+
+```
+read_lock 期间:
+  task ──► PID_N (有效) ──.tasks.next──► PID_{N+1} (有效)
+  next ──► 仍指向 PID_{N+1} ← 这是一个 task_struct*，单独保存
+
+read_unlock 之后:
+  task ──► PID_N (可能已退出! 内存可能被回收!)
+  
+  如果此时访问 task->tasks.next:
+    = PID_N->tasks.next = UAF! ← 访问已释放的内存
+  
+  但我们用的是 next:
+    next = PID_{N+1} ← 保存的是指针值，独立于 PID_N
+    只要 PID_{N+1} 还没退出，next 就仍然有效
+    RCU 宽限期保证 PID_{N+1} 不会毫无预警地消失
+```
+
+#### `sys_proc_stat` 为什么可以全程持锁
+
+```c
+SYSCALL_DEFINE1(proc_stat, struct proc_stat __user *, stat) {
+    struct proc_stat kstat;
+    memset(&kstat, 0, sizeof(kstat));
+    
+    read_lock(&tasklist_lock);
+    for_each_process(task) {         // 持锁遍历
+        kstat.total_processes++;     // 纯内存操作
+        switch (...) { ... }         // 纯内存操作
+    }
+    read_unlock(&tasklist_lock);
+    
+    copy_to_user(stat, &kstat, sizeof(kstat));  // ← 唯一的拷贝，在锁外!
+    return 0;
+}
+```
+
+对比：`proc_collect` 每进程拷贝一次（N 次 × `copy_to_user`），必须反复释放锁。`proc_stat` 全遍历完只拷贝一次（1 次 × `copy_to_user`），全程持锁即可。
+
+### 9.5 copy_to_user() 内部机制
+
+`copy_to_user()` 不像名字暗示的那样只是一个 `memcpy`。它实际上做了：
+
+```
+copy_to_user(void __user *to, const void *from, unsigned long n)
+  │
+  ├─ 1. might_fault()            ← 标记"可能缺页", 调试用
+  │
+  ├─ 2. access_ok(to, n)         ← 权限检查 (见图解)
+  │      └─ 验证 [to, to+n) 完全落在用户态地址空间
+  │         (x86_64: to < TASK_SIZE_MAX = 0x800000000000)
+  │
+  ├─ 3. stac() / user_access_begin()  ← 临时关闭 SMAP
+  │      └─ SMAP: Ring 0 默认禁止访问用户页, 必须显式放行
+  │         stac = Set AC flag in RFLAGS
+  │
+  ├─ 4. copy_user_generic(to, from, n)  ← 实际 memcpy
+  │      └─ 使用 REP MOVSB 或类似指令
+  │      └─ 每条指令都可能触发缺页异常
+  │
+  ├─ 5. clac() / user_access_end() ← 重新启用 SMAP
+  │
+  └─ 6. return (n - bytes_copied)  ← 返回未拷贝的字节数 (0=成功)
+```
+
+#### `access_ok()` — 为什么需要权限检查
+
+```
+用户态地址空间 (x86_64):
+  0x0000000000000000 ─ 0x00007FFFFFFFFFFF  ← 用户可访问
+  0x0000800000000000 ─ 0xFFFFFFFFFFFFFFFF  ← 内核专用 ("非规范地址" 分隔)
+  
+access_ok(ptr, size) 检查:
+  1. ptr 不是内核地址 (无 RCE 攻击 — 不允许用户说"帮我写到内核地址")
+  2. ptr + size 不溢出 48 位地址空间
+  3. ptr 指向的实际 VMA 有写权限 (某些架构在 access_ok 中做, x86_64 推迟到缺页时)
+```
+
+#### 为什么 copy_to_user() 可能睡眠
+
+```
+copy_user_generic() 执行中:
+  
+  MOV [rdi], rsi    ← rdi = 用户态 buf 地址, rsi = 内核 kinfo 数据
+    │
+    ├─ TLB 查询: rdi 对应的物理页?
+    │    └─ TLB 未命中 → 页表遍历 (可能缺页)
+    │
+    ├─ 页表项 Present=0?
+    │    ├─ 被 swap 换出 → do_swap_page() → 磁盘 I/O → 睡眠!
+    │    ├─ Copy-on-Write → do_wp_page() → 分配新页
+    │    └─ mmap 文件映射 → filemap_fault() → 磁盘 I/O → 睡眠!
+    │
+    └─ 页表项 Present=1, 但 Write=0?
+         └─ 写保护 → do_wp_page() 处理
+```
+
+缺页处理路径 (`do_page_fault → handle_mm_fault → ...`) 可能：
+- 分配物理页 (`alloc_pages`) — 不睡眠
+- 磁盘 I/O (`swap_readpage`, `filemap_read`) — **睡眠**
+- 等待内存回收 (`__GFP_DIRECT_RECLAIM`) — **睡眠**
+
+这就是为什么内核文档反复强调：
+
+> **"Do not call copy_to_user() while holding a spinlock or RCU read lock."**
+
+### 9.6 完整执行轨迹：sys_proc_collect (470)
+
+以下是一次 `syscall(470, buf, 8192, &count)` 的完整 20 步执行轨迹。
+假设系统有 381 个进程。
+
+```
+┌──── 步骤 ────┬──── CPU/锁状态 ────┬──── 内存活动 ────────────────────┐
+│              │                    │                                  │
+│ 1. 用户态    │ Ring 3             │ 栈上准备 syscall 参数             │
+│    glibc     │ 无锁               │ rax=470, rdi=buf, rsi=8192,      │
+│              │                    │ rdx=&count                       │
+│              │                    │                                  │
+│ 2. syscall   │ Ring 3 → Ring 0    │ HW: RCX←RIP, R11←RFLAGS,        │
+│    指令      │ 无锁               │ RIP←MSR_LSTAR, CPL←0             │
+│              │                    │                                  │
+│ 3. entry_    │ Ring 0             │ swapgs, 切换内核栈               │
+│    SYSCALL_64│ 无锁               │ 压入 pt_regs (保存所有用户寄存器) │
+│              │                    │ rsp 指向内核栈                   │
+│              │                    │                                  │
+│ 4. do_       │ Ring 0             │ 查 sys_call_table[470]           │
+│    syscall_64│ 无锁               │ → 调用 sys_proc_collect()        │
+│              │                    │                                  │
+│ 5. sys_proc_ │ Ring 0             │ 校验参数: user_buf!=NULL,        │
+│    collect   │ 无锁               │ max_count>0, ret_count!=NULL     │
+│    入口      │                    │                                  │
+│              │                    │                                  │
+│ 6. 持锁      │ Ring 0             │ task = next_task(&init_task)     │
+│    开始遍历  │ read_lock ✓        │ → 跳过哨兵, 拿到 PID=1           │
+│              │ 禁用抢占           │                                  │
+│              │                    │                                  │
+│ 7. 读取      │ Ring 0             │ get_task_comm(kinfo.comm, task)  │
+│    task_struct│ read_lock ✓       │ kinfo.pid = task_tgid_nr(task)   │
+│    (PID=1)   │                    │ task_cputime() → u64 ut/st       │
+│              │                    │ nsec_to_clock_t() → 滴答         │
+│              │                    │ total_vm, rss, nice, threads, uid│
+│              │                    │ kinfo.state = __state | exit_state│
+│              │                    │ 共读取 ~12 个 task_struct 字段    │
+│              │                    │                                  │
+│ 8. 保存 next │ Ring 0             │ next = next_task(task)           │
+│    释放锁    │ read_lock ✓        │ → task->tasks.next               │
+│              │                    │ read_unlock(&tasklist_lock)      │
+│              │                    │                                  │
+│ 9. 拷贝到    │ Ring 0             │ access_ok(&buf[0], 80) → pass    │
+│    用户态    │ 无锁 (!!)          │ stac()  ← 禁用 SMAP              │
+│              │ 可被抢占           │ copy 80B: kinfo → buf[0]         │
+│              │ 可能睡眠           │ clac()  ← 启用 SMAP              │
+│              │                    │                                  │
+│10. 重新持锁  │ Ring 0             │ read_lock(&tasklist_lock)        │
+│    继续遍历  │ read_lock ✓        │ task = next (=PID=2)             │
+│              │                    │ count++                          │
+│              │                    │                                  │
+│11-17.        │ ... 重复步骤 7-10 对 PID=2 到 PID=381 ...              │
+│    循环      │ 每进程切换锁状态    │ 每进程 1 次 copy_to_user()       │
+│    ×380次    │ 共 381 次          │ 共 381 × 80B = 30,480B 拷贝      │
+│    更多      │ read_lock/unlock   │ 至多 381 个 task 遍历            │
+│              │                    │                                  │
+│18. 循环结束  │ Ring 0             │ task == &init_task (回到哨兵)    │
+│              │ read_lock ✓        │ read_unlock(&tasklist_lock)      │
+│              │                    │                                  │
+│19. 写回 count│ Ring 0             │ copy_to_user(ret_count,          │
+│              │ 无锁               │             &count, sizeof(int)) │
+│              │                    │ → 写回用户态 &count              │
+│              │                    │                                  │
+│20. 返回      │ Ring 0 → Ring 3    │ sysretq: 恢复 RIP/RFLAGS/RSP     │
+│    用户态    │ 无锁               │ rax = 0 (返回值)                 │
+│              │                    │ buf[] 现已填入 381 个 proc_info  │
+│              │                    │ count 已写入 381                 │
+└──────────────┴────────────────────┴──────────────────────────────────┘
+```
+
+**时间估算**（假定 1GHz CPU, 381 个进程）：
+
+| 阶段 | 每次耗时 | 381次总耗时 |
+|:---|:---|:---|
+| 读 task_struct 字段 (~12 次指针解引用) | ~0.5μs | ~190μs |
+| `read_unlock` + `read_lock` 对 | ~0.1μs | ~38μs |
+| `copy_to_user()` (80B, L1 cache) | ~0.2μs | ~76μs |
+| `copy_to_user()` (80B, 缺页) | ~10ms | — (罕见) |
+| **正常总耗时** | | **~300-500μs** |
+| 如果每个进程都缺页 | | **~3.8 秒** (极罕见) |
+
+这就是 SYSCALL 视图中 `proc_collect` 延迟通常在 300-2000μs 的原因。
+
+### 9.7 三个系统调用的差异对比
+
+| 维度 | collect (470) | snapshot (471) | stat (472) |
+|:---|:---|:---|:---|
+| **输出** | `struct proc_info[N]` | `struct proc_tree_node[N]` | `struct proc_stat` (1个) |
+| **每进程拷贝量** | 80B | 28B | 0 (聚合后一次 36B) |
+| **锁模式** | lock-drop-copy-relock | lock-drop-copy-relock | 全程持锁 |
+| **`copy_to_user` 调用次数** | N+1 次 | N+1 次 | 1 次 |
+| **遍历中能否睡眠** | 是 (锁外) | 是 (锁外) | 否 (全程持锁) |
+| **内核栈峰值使用** | ~200B (kinfo + 局部变量) | ~200B (knode + 局部变量) | ~50B (仅计数器) |
+| **典型延迟 (381进程)** | 300-2000μs | 300-1500μs | 50-100μs |
+| **最大风险** | 遍历期间进程数变化 | 同 collect | 基本无风险 |
+
+为什么 snapshot 比 collect 快：
+- 输出结构更小 (28B vs 80B → `copy_to_user` 更快)
+- 字段采集更简单 (不需要 `task_cputime`, `get_mm_rss` 等耗时函数)
+- 不需要合并 `__state | exit_state`
+
+为什么 stat 快得多：
+- 只做整数计数，不拷贝内存
+- 最后一次 `copy_to_user` 只拷贝 36B
+- 全程持锁无需反复加锁/解锁
+
+### 9.8 关键指针与内存安全
+
+#### 用户态 buf 指针：信任但验证
+
+```c
+// 用户传入:
+struct proc_info *user_buf = malloc(sizeof(struct proc_info) * 8192);
+syscall(470, user_buf, 8192, &count);
+
+// 内核收到的是一个"裸"指针值 (如 0x7f1234560000)
+// 内核不能直接假设它有效!
+```
+
+内核安全处理链条：
+
+```
+user_buf (用户态指针, 值=0x7f1234560000)
+  │
+  ├─ 1. 不直接解引用 ← 硬件 SMAP 阻止
+  │
+  ├─ 2. access_ok(user_buf, max_count * 80)
+  │      └─ 验证: 地址在用户空间 (≤ 0x800000000000)
+  │      └─ 验证: 地址 + 大小不溢出
+  │
+  ├─ 3. copy_to_user(&user_buf[i], &kinfo, 80)
+  │      └─ stac() 临时禁用 SMAP
+  │      └─ 逐字节拷贝 (缺页时内核代为处理)
+  │      └─ clac() 重新启用 SMAP
+  │
+  └─ 4. 如果 user_buf[i] 的页没有映射?
+         → 内核缺页处理 → 检查 VMA → 
+           如果是合法 VMA: 分配物理页, 继续拷贝
+           如果是非法地址: 发送 SIGSEGV 给进程
+```
+
+#### 内核指针绝不泄露到用户态
+
+```c
+// 什么内核不做的 (对比错误做法):
+kinfo.internal_ptr = task;               // ❌ task_struct* 泄露!
+kinfo.mm_ptr       = task->mm;           // ❌ mm_struct* 泄露!
+kinfo.stack_ptr    = task->stack;        // ❌ 内核栈地址泄露!
+
+// 什么内核做的:
+kinfo.pid  = task_tgid_nr(task);         // ✓ 整数 PID
+kinfo.uid  = from_kuid_munged(...);      // ✓ 整数 UID (经过命名空间映射)
+kinfo.utime = nsec_to_clock_t(ut_ns);    // ✓ 整数 CPU 时间
+kinfo.vsize = task->mm ? task->mm->total_vm << PAGE_SHIFT : 0;  // ✓ 整数大小
+```
+
+所有给用户态的数据都是**值类型**（整数、字符数组），不包含任何指针。
+
+#### 内核栈限制：为什么不分配大数组
+
+```c
+// 错误做法 (本项目绝不这样写!):
+SYSCALL_DEFINE3(proc_collect, ...) {
+    struct proc_info local_array[8192];  // 80 × 8192 = 655,360 字节
+    // 内核栈只有 16KB! → 栈溢出 → 内核 panic!
+    ...
+}
+
+// 正确做法:
+SYSCALL_DEFINE3(proc_collect, ...) {
+    struct proc_info kinfo;  // 80 字节 — 刚好
+    // 循环: 填充 kinfo → copy_to_user → 下一个
+    ...
+}
+```
+
+x86_64 内核栈限制：
+- 总大小：`THREAD_SIZE = 16KB` (4 pages)
+- 可用空间：~12KB（`pt_regs` 和中断帧占约 4KB）
+- 超过限制 → `stack overflow` → 内核 panic (不可恢复)
+- 即使递归也要用 `CONFIG_STACKPROTECTOR` 保护
+
+#### 反 UAF 的 next 指针保存
+
+这是在 §9.4 已详述的，这里用代码对比形式总结：
+
+```c
+// ❌ 错误 — UAF
+read_lock(&tasklist_lock);
+task = next_task(&init_task);
+while (task != &init_task) {
+    fill_kinfo(&kinfo, task);
+    read_unlock(&tasklist_lock);
+    copy_to_user(&buf[i++], &kinfo, sizeof(kinfo));
+    read_lock(&tasklist_lock);
+    task = list_next_entry(task, tasks);  // ← UAF! task 可能已被释放
+}
+
+// ✓ 正确 — 无 UAF
+read_lock(&tasklist_lock);
+task = next_task(&init_task);
+while (task != &init_task) {
+    fill_kinfo(&kinfo, task);
+    next = next_task(task);               // ← 持锁时保存
+    read_unlock(&tasklist_lock);
+    copy_to_user(&buf[i++], &kinfo, sizeof(kinfo));
+    read_lock(&tasklist_lock);
+    task = next;                          // ← 使用保存的, 不做指针追踪
+}
+```
+
 
 ---
 
