@@ -136,6 +136,9 @@ static const char *g_view_names[N_VIEWS] = {
 static int  g_sort_field = 0;    /* 0=pid,1=cpu,2=mem,3=name */
 static int  g_sort_desc  = 0;
 
+/* HEX-DUMP 视图：单独跟踪被转储的进程 */
+static int  g_hex_selected = 0;  /* 被 dump 的进程在过滤后列表中的索引 */
+
 /* 过滤 */
 static char g_filter[64] = "";
 static int  g_filter_active = 0;
@@ -443,8 +446,8 @@ static int cmp_pid(const void *a, const void *b)
 static int cmp_cpu(const void *a, const void *b)
 {
 	const struct proc_info *pa = a, *pb = b;
-	unsigned long ca = pa->utime + pa->stime;
-	unsigned long cb = pb->utime + pb->stime;
+	double ca = cpu_pct(pa->pid, pa->utime + pa->stime);
+	double cb = cpu_pct(pb->pid, pb->utime + pb->stime);
 	return (ca > cb) - (ca < cb);
 }
 static int cmp_mem(const void *a, const void *b)
@@ -926,29 +929,33 @@ static void render_tree_view(int max_rows, int cols)
 /* ---- View 3: Hex Dump ---- */
 static void render_hex_view(int max_rows, int cols)
 {
-	int idx, row, i;
+	int proc_idx, row, i;
 	(void)cols;
 
 	wattron(win_main, COLOR_PAIR(5));
 	mvwprintw(win_main, 0, 2, " ProcMon [HEX-DUMP] ");
 	wattroff(win_main, COLOR_PAIR(5));
-	mvwprintw(win_main, 0, 22, "| sizeof(proc_info)=%zu bytes | %s",
-		  sizeof(struct proc_info), g_last_msg);
+	mvwprintw(win_main, 0, 22, "| sizeof(proc_info)=%zu bytes | proc %d/%d | %s",
+		  sizeof(struct proc_info),
+		  g_hex_selected + 1, filtered_count(),
+		  g_last_msg);
 	mvwhline(win_main, 1, 0, ACS_HLINE, cols);
 
-	/* 找到过滤后选中的进程 */
-	idx = filtered_index(g_selected);
-	if (idx < 0) {
-		mvwprintw(win_main, 3, 2, "(no process selected)");
+	/* 使用 g_hex_selected 确定被 dump 的进程 (与 g_selected 解耦) */
+	proc_idx = filtered_index(g_hex_selected);
+	if (proc_idx < 0) {
+		mvwprintw(win_main, 3, 2,
+			  "(no process selected — %d total, %d after filter)",
+			  g_proc_count, filtered_count());
 		return;
 	}
 
 	{
-		const unsigned char *raw = (const unsigned char *)&g_procs[idx];
+		const unsigned char *raw = (const unsigned char *)&g_procs[proc_idx];
 		int total_size = (int)sizeof(struct proc_info);
 		int n_rows = (total_size + 15) / 16;
 
-		/* 修正滚动: 在 hex 视图中 g_selected = hex 行号 */
+		/* HEX-DUMP 中 g_selected = hex 行光标 (与进程索引无关) */
 		if (g_selected >= n_rows) g_selected = n_rows - 1;
 		if (g_selected < 0) g_selected = 0;
 		if (g_selected < g_scroll)
@@ -1187,7 +1194,7 @@ static void render_detail_panel(void)
 		return;
 	}
 
-	idx = filtered_index(g_selected);
+	idx = filtered_index(g_view_mode == 3 ? g_hex_selected : g_selected);
 	if (idx < 0) {
 		mvwprintw(win_detail, 0, 2,
 			  "(no process selected — %d total, %d after filter)",
@@ -1270,6 +1277,17 @@ static void render_hint_panel(void)
 		wattron(win_hint, A_REVERSE);
 		mvwprintw(win_hint, 0, 0, " FILTER: %s_", g_cmd);
 		wattroff(win_hint, A_REVERSE);
+	} else if (g_view_mode == 3) {
+		/* HEX-DUMP 视图: 特殊提示 */
+		wattron(win_hint, COLOR_PAIR(5));
+		mvwprintw(win_hint, 0, 0,
+			  " v:view[%s] n/p:prev/next-proc "
+			  "%s%s:scroll Tab:sort s:rev "
+			  "/:filter r:clear x:export h:help q:quit",
+			  g_view_names[g_view_mode],
+			  "\xe2\x86\x91\xe2\x86\x93",  /* ↑↓ (UTF-8 arrows) */
+			  "");
+		wattroff(win_hint, COLOR_PAIR(5));
 	} else {
 		wattron(win_hint, COLOR_PAIR(5));
 		mvwprintw(win_hint, 0, 0,
@@ -1626,16 +1644,43 @@ int main(void)
 
 		/* 视图切换 */
 		case 'v':
+		case 'V':
+			if (g_view_mode == 3) {
+				/* 离开 HEX-DUMP: 恢复进程选择 */
+				g_selected = g_hex_selected;
+			}
 			g_view_mode = (g_view_mode + 1) % N_VIEWS;
-			g_selected = 0;
+			if (g_view_mode == 3) {
+				/* 进入 HEX-DUMP: 固定当前进程, hex 行从 0 开始 */
+				g_hex_selected = g_selected;
+				g_selected = 0;
+			} else {
+				g_selected = 0;
+			}
 			g_scroll = 0;
 			break;
 
-		case '1': g_view_mode = 0; g_selected = 0; g_scroll = 0; break;
-		case '2': g_view_mode = 1; g_selected = 0; g_scroll = 0; break;
-		case '3': g_view_mode = 2; g_selected = 0; g_scroll = 0; break;
-		case '4': g_view_mode = 3; g_selected = 0; g_scroll = 0; break;
-		case '5': g_view_mode = 4; g_selected = 0; g_scroll = 0; break;
+		case '1':
+			if (g_view_mode == 3) g_selected = g_hex_selected;
+			g_view_mode = 0; g_selected = 0; g_scroll = 0; break;
+		case '2':
+			if (g_view_mode == 3) g_selected = g_hex_selected;
+			g_view_mode = 1; g_selected = 0; g_scroll = 0; break;
+		case '3':
+			if (g_view_mode == 3) g_selected = g_hex_selected;
+			g_view_mode = 2; g_selected = 0; g_scroll = 0; break;
+		case '4':
+			if (g_view_mode != 3) {
+				/* 从其他视图进入 HEX-DUMP */
+				g_hex_selected = g_selected;
+			}
+			g_view_mode = 3;
+			g_selected = 0;   /* hex 行号重置 */
+			g_scroll = 0;
+			break;
+		case '5':
+			if (g_view_mode == 3) g_selected = g_hex_selected;
+			g_view_mode = 4; g_selected = 0; g_scroll = 0; break;
 
 		/* 导航 */
 		case KEY_UP: case 'k':
@@ -1647,12 +1692,42 @@ int main(void)
 			break;
 
 		case KEY_PPAGE:
-			g_selected -= 20;
+			if (g_view_mode == 3)
+				g_selected -= 16;
+			else
+				g_selected -= 20;
 			if (g_selected < 0) g_selected = 0;
 			break;
 
 		case KEY_NPAGE:
-			g_selected += 20;
+			if (g_view_mode == 3)
+				g_selected += 16;
+			else
+				g_selected += 20;
+			break;
+
+		/* HEX-DUMP: 切换被 dump 的进程 */
+		case 'n':
+			if (g_view_mode == 3) {
+				int total = filtered_count();
+				if (total > 0) {
+					g_hex_selected = (g_hex_selected + 1) % total;
+					g_selected = 0;
+					g_scroll = 0;
+				}
+			}
+			break;
+		case 'p':
+			if (g_view_mode == 3) {
+				int total = filtered_count();
+				if (total > 0) {
+					g_hex_selected--;
+					if (g_hex_selected < 0)
+						g_hex_selected = total - 1;
+					g_selected = 0;
+					g_scroll = 0;
+				}
+			}
 			break;
 
 		case KEY_HOME:
