@@ -15,7 +15,7 @@
  * 安全设计:
  *   - rcu_read_lock() 保护遍历，杜绝 UAF: 所有 task_struct 在 RCU
  *     读临界区内不会被释放（__put_task_struct 通过 call_rcu 延迟回收）
- *   - 内核缓冲区 kvmalloc_array: 持锁一次性填充，释放锁后统一
+ *   - vmalloc 内核缓冲区: 持锁一次性填充，释放锁后统一
  *     copy_to_user，消除持锁睡眠和锁间竞争窗口
  *   - 所有用户态数据通过 copy_to_user() 传递，杜绝内核指针泄露
  *
@@ -38,7 +38,7 @@
 #include <linux/cred.h>
 #include <linux/pid.h>
 #include <linux/mm.h>
-#include <linux/kvmalloc.h>
+#include <linux/vmalloc.h>
 #include <linux/proc_monitor.h>
 
 /* =========================================================================
@@ -51,7 +51,7 @@
  * 返回: 0 成功; -EINVAL 参数无效; -ENOMEM 内核内存不足; -EFAULT 拷贝失败
  *
  * 实现要点:
- *   1. kvmalloc_array 分配内核中转缓冲区（优先 kmalloc，失败则降级 vmalloc）
+ *   1. vmalloc 分配内核中转缓冲区
  *   2. rcu_read_lock() + for_each_process() 一次性遍历所有进程填入 kbuf
  *   3. 释放 RCU 锁后一次性 copy_to_user，杜绝 UAF 和持锁睡眠
  *   4. RCU 保护期间 task_struct 不会被释放（见 __put_task_struct → call_rcu）
@@ -69,11 +69,8 @@ SYSCALL_DEFINE3(proc_collect,
 		return -EINVAL;
 
 	/* 内核分配中转缓冲区。
-	 * kvmalloc_array 对于大数组自动降级到 vmalloc，比纯 kmalloc 更可靠。
-	 * 若内核不支持 kvmalloc_array（< 4.12），可替换为:
-	 *   kbuf = vmalloc(max_count * sizeof(struct proc_info));
-	 *   // ... vfree(kbuf); */
-	kbuf = kvmalloc_array(max_count, sizeof(struct proc_info), GFP_KERNEL);
+	 * vmalloc 分配虚拟连续内存，适合可能很大的数组。 */
+	kbuf = vmalloc(max_count * sizeof(struct proc_info));
 	if (!kbuf)
 		return -ENOMEM;
 
@@ -146,15 +143,15 @@ SYSCALL_DEFINE3(proc_collect,
 
 	/* RCU 锁已释放，可以安全调用可能睡眠的 copy_to_user */
 	if (copy_to_user(user_buf, kbuf, count * sizeof(struct proc_info))) {
-		kvfree(kbuf);
+		vfree(kbuf);
 		return -EFAULT;
 	}
 	if (copy_to_user(ret_count, &count, sizeof(int))) {
-		kvfree(kbuf);
+		vfree(kbuf);
 		return -EFAULT;
 	}
 
-	kvfree(kbuf);
+	vfree(kbuf);
 	return 0;
 }
 
@@ -197,7 +194,7 @@ static int compute_level(struct task_struct *task)
  * 用户态可基于 pid/ppid 关系重建完整父子树，也可直接使用 level
  * 字段按缩进打印树结构。导出为 Graphviz DOT 格式可图形化展示。
  *
- * 实现: 同 sys_proc_collect — kvmalloc 中转缓冲区 + RCU 遍历。
+ * 实现: 同 sys_proc_collect — vmalloc 中转缓冲区 + RCU 遍历。
  * ========================================================================= */
 SYSCALL_DEFINE3(proc_snapshot,
 		struct proc_tree_node __user *, user_buf,
@@ -211,7 +208,7 @@ SYSCALL_DEFINE3(proc_snapshot,
 	if (!user_buf || max_count <= 0 || !ret_count)
 		return -EINVAL;
 
-	kbuf = kvmalloc_array(max_count, sizeof(struct proc_tree_node), GFP_KERNEL);
+	kbuf = vmalloc(max_count * sizeof(struct proc_tree_node));
 	if (!kbuf)
 		return -ENOMEM;
 
@@ -232,15 +229,15 @@ SYSCALL_DEFINE3(proc_snapshot,
 	rcu_read_unlock();
 
 	if (copy_to_user(user_buf, kbuf, count * sizeof(struct proc_tree_node))) {
-		kvfree(kbuf);
+		vfree(kbuf);
 		return -EFAULT;
 	}
 	if (copy_to_user(ret_count, &count, sizeof(int))) {
-		kvfree(kbuf);
+		vfree(kbuf);
 		return -EFAULT;
 	}
 
-	kvfree(kbuf);
+	vfree(kbuf);
 	return 0;
 }
 
