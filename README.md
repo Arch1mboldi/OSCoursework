@@ -88,9 +88,10 @@ sudo ./proc_monitor
 检查、临时关闭 SMAP、处理缺页异常。
 
 **锁策略**:
-进程链表由 RCU 和 `tasklist_lock` 保护。关键约束——RCU 读者不能睡眠，而 `copy_to_user()`
-可能因缺页触发磁盘 I/O 而睡眠。因此必须采用 lock-drop-copy-relock 模式：持锁读取数据
-并保存 `next_task()` 指针，释放锁后调用 `copy_to_user()`，再重新加锁用保存的指针继续遍历。
+使用 `rcu_read_lock()` 保护进程链表遍历（替代 `tasklist_lock`），配合 `kvmalloc_array`
+内核中转缓冲区：在 RCU 读临界区内一次性将所有进程数据填入 `kbuf`（期间 task_struct 不会
+被释放），释放 RCU 锁后统一 `copy_to_user`。这彻底消除了 lock-drop-copy-relock 模式中
+"保存的 next 指针在 copy_to_user 睡眠期间因 RCU 宽限期完成而变为悬空指针"的 UAF 风险。
 
 **状态编码**:
 Linux 5.14+ 将进程状态拆分为 `task->__state`（调度状态）和 `task->exit_state`（退出状态）。
@@ -104,13 +105,14 @@ Linux 5.14+ 将进程状态拆分为 `task->__state`（调度状态）和 `task-
 本项目使用的 Linux 内核函数：
 
 - `SYSCALL_DEFINEn()` (`<linux/syscalls.h>`) — 定义系统调用入口
-- `for_each_process()`, `next_task()`, `get_task_comm()`, `task_tgid_nr()`, `task_nice()` (`<linux/sched.h>`) — 进程遍历与字段读取
-- `read_lock()`, `read_unlock()` — tasklist_lock 读写锁
+- `rcu_read_lock()`, `rcu_read_unlock()` (`<linux/rcupdate.h>`) — RCU 读临界区保护
+- `for_each_process()`, `next_task()`, `get_task_comm()`, `task_tgid_nr()`, `task_nice()`, `rcu_dereference()`, `for_each_thread()` (`<linux/sched.h>`) — 进程遍历与字段读取
 - `task_cputime()` (`<linux/sched/cputime.h>`) — 读取 CPU 时间（纳秒）
 - `nsec_to_clock_t()` (`<linux/jiffies.h>`) — 纳秒转换为 USER_HZ 滴答
 - `get_mm_rss()`, `PAGE_SHIFT` (`<linux/mm.h>`) — 读取内存信息
 - `from_kuid_munged()` (`<linux/cred.h>`) — UID 命名空间映射
 - `copy_to_user()` (`<linux/uaccess.h>`) — 内核到用户态数据拷贝
+- `kvmalloc_array()`, `kvfree()` (`<linux/kvmalloc.h>`) — 内核动态内存分配与释放
 
 本项目自实现的函数：
 - 内核侧：`sys_proc_collect()` (470), `sys_proc_snapshot()` (471), `sys_proc_stat()` (472), `compute_level()`
@@ -122,6 +124,7 @@ Linux 5.14+ 将进程状态拆分为 `task->__state`（调度状态）和 `task-
 
 - Linux 内核: `Documentation/process/adding-syscalls.rst` — 系统调用注册规范
 - Linux 内核: `Documentation/RCU/listRCU.rst` — RCU 链表遍历
+- Linux 内核: `Documentation/RCU/rcu.rst` — RCU 宽限期与 call_rcu 机制
 - Linux 内核: `Documentation/filesystems/proc.rst` — `/proc/pid/stat` 字段定义
 - Linux 内核: `Documentation/mm/active_mm.rst` — 内核线程 (`mm==NULL`) 语义
 - 本项目: [`principles.md`](principles.md) — 完整原理说明、内存布局、调试指南、bug 记录

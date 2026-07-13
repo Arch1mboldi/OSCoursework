@@ -62,88 +62,89 @@ SYSCALL_DEFINE3(proc_collect,
         int, max_count,
         int __user *, ret_count)
 {
-    struct proc_info kinfo;
-    struct task_struct *task, *next;
+    struct proc_info *kbuf;
+    struct task_struct *task;
     int count = 0;
-    unsigned long nr_threads;
 
     if (!user_buf || max_count <= 0 || !ret_count)
         return -EINVAL;
 
-    read_lock(&tasklist_lock);
-    task = next_task(&init_task);  /* 跳过头结点 init_task */
+    /* 内核分配中转缓冲区。
+     * kvmalloc_array 对于大数组自动降级到 vmalloc，
+     * 比纯 kmalloc 更可靠。 */
+    kbuf = kvmalloc_array(max_count, sizeof(struct proc_info), GFP_KERNEL);
+    if (!kbuf)
+        return -ENOMEM;
 
-    while (task != &init_task) {
+    /*
+     * RCU 读临界区保护遍历: 期间所有 task_struct 不会被释放。
+     * for_each_process 是 RCU-safe 的进程链表遍历宏。
+     *
+     * 注意: rcu_read_lock() 期间绝对不能睡眠！
+     */
+    rcu_read_lock();
+    for_each_process(task) {
         if (count >= max_count)
             break;
 
-        memset(&kinfo, 0, sizeof(kinfo));
+        memset(&kbuf[count], 0, sizeof(struct proc_info));
 
         /* 安全获取进程名 */
-        get_task_comm(kinfo.comm, task);
+        get_task_comm(kbuf[count].comm, task);
 
-        /* PID / PPID */
-        kinfo.pid  = task_tgid_nr(task);
-        kinfo.ppid = task_tgid_nr(task->real_parent);
+        /* PID / PPID。
+         * rcu_dereference() 确保编译器不会将 real_parent 的读取
+         * 优化到临界区之外，且正确处理 reparent 的并发更新。 */
+        kbuf[count].pid  = task_tgid_nr(task);
+        kbuf[count].ppid = task_tgid_nr(rcu_dereference(task->real_parent));
 
         /* 进程状态: __state 与 exit_state 合并 */
-        kinfo.state = task->__state | task->exit_state;
+        kbuf[count].state = task->__state | task->exit_state;
 
         /* CPU time: 纳秒 → USER_HZ 时钟滴答 */
         {
             u64 ut_ns, st_ns;
             task_cputime(task, &ut_ns, &st_ns);
-            kinfo.utime = nsec_to_clock_t(ut_ns);
-            kinfo.stime = nsec_to_clock_t(st_ns);
+            kbuf[count].utime = nsec_to_clock_t(ut_ns);
+            kbuf[count].stime = nsec_to_clock_t(st_ns);
         }
 
         /* 内存信息: 内核线程 mm==NULL */
         if (task->mm) {
-            kinfo.vsize = task->mm->total_vm << PAGE_SHIFT;
-            kinfo.rss   = get_mm_rss(task->mm);
+            kbuf[count].vsize = task->mm->total_vm << PAGE_SHIFT;
+            kbuf[count].rss   = get_mm_rss(task->mm);
         } else {
-            kinfo.vsize = 0;
-            kinfo.rss   = 0;
+            kbuf[count].vsize = 0;
+            kbuf[count].rss   = 0;
         }
 
-        kinfo.nice = task_nice(task);
+        kbuf[count].nice = task_nice(task);
 
-        /* 线程数 */
+        /* 线程数。signal 在进程退出期间可能变为 NULL，
+         * RCU 保证 task_struct 地址有效，NULL 时保守取 1。 */
         if (task->signal)
-            nr_threads = task->signal->nr_threads;
+            kbuf[count].num_threads = (int)task->signal->nr_threads;
         else
-            nr_threads = 1;
-        kinfo.num_threads = (int)nr_threads;
+            kbuf[count].num_threads = 1;
 
         /* UID: 从内核命名空间映射 */
-        kinfo.uid = from_kuid_munged(current_user_ns(), task_uid(task));
-
-        /*
-         * 保存 next 指针后再释放锁:
-         *   - copy_to_user() 可能睡眠, 不能在持锁时调用
-         *   - task 在释放锁期间可能因进程退出而被 RCU 回收
-         *   - 必须用保存的 next 指针继续遍历
-         */
-        next = next_task(task);
-        read_unlock(&tasklist_lock);
-
-        if (copy_to_user(&user_buf[count], &kinfo, sizeof(kinfo))) {
-            /* 拷贝失败，尽力返回已成功拷贝的数量 */
-            if (copy_to_user(ret_count, &count, sizeof(int)))
-                return -EFAULT;
-            return -EFAULT;
-        }
-
+        kbuf[count].uid = from_kuid_munged(current_user_ns(),
+                                           task_uid(task));
         count++;
-        read_lock(&tasklist_lock);
-        task = next;  /* 使用保存的 next，而非 task->tasks.next */
+    }
+    rcu_read_unlock();
+
+    /* RCU 锁已释放，可以安全调用可能睡眠的 copy_to_user */
+    if (copy_to_user(user_buf, kbuf, count * sizeof(struct proc_info))) {
+        kvfree(kbuf);
+        return -EFAULT;
+    }
+    if (copy_to_user(ret_count, &count, sizeof(int))) {
+        kvfree(kbuf);
+        return -EFAULT;
     }
 
-    read_unlock(&tasklist_lock);
-
-    if (copy_to_user(ret_count, &count, sizeof(int)))
-        return -EFAULT;
-
+    kvfree(kbuf);
     return 0;
 }
 ```
@@ -151,14 +152,24 @@ SYSCALL_DEFINE3(proc_collect,
 ### 1.3 compute_level — 进程树深度计算
 
 ```c
+/*
+ * 计算进程在进程树中的深度。
+ * 调用者需持有 rcu_read_lock()。
+ *
+ * rcu_dereference() 用于每次访问 real_parent，因为 reparent
+ * 操作（父进程退出时子进程被收养到 init/subreaper）会在
+ * 我们遍历期间并发修改父指针。RCU 保证被引用的 task_struct
+ * 地址有效，但父指针内容可能变化。
+ */
 static int compute_level(struct task_struct *task)
 {
+    struct task_struct *parent;
     int level = 0;
-    struct task_struct *parent = task->real_parent;
 
+    parent = rcu_dereference(task->real_parent);
     while (parent && parent != &init_task) {
         level++;
-        parent = parent->real_parent;
+        parent = rcu_dereference(parent->real_parent);
     }
     return level;
 }
@@ -170,36 +181,37 @@ static int compute_level(struct task_struct *task)
 SYSCALL_DEFINE1(proc_stat, struct proc_stat __user *, stat)
 {
     struct proc_stat kstat;
-    struct task_struct *task;
+    struct task_struct *p, *t;
 
     if (!stat)
         return -EINVAL;
 
     memset(&kstat, 0, sizeof(kstat));
 
-    read_lock(&tasklist_lock);
+    rcu_read_lock();
 
-    for_each_process(task) {
+    for_each_process(p) {
         kstat.total_processes++;
 
         /*
-         * 先检查退出状态 (exit_state):
-         *   EXIT_ZOMBIE — 僵尸进程
+         * 状态分类: 先检查退出状态 (exit_state)，再检查调度状态。
+         *
+         * exit_state:
+         *   EXIT_ZOMBIE — 僵尸进程，等待父进程 wait()
          *   EXIT_DEAD   — 进程正被回收, 不计数
+         *
+         * __state 可能带有标志位:
+         *   TASK_WAKEKILL (0x0080)
+         *   TASK_NOLOAD   (0x0400)
+         *   TASK_WAKING   (0x0100)
+         * 必须先用掩码清除标志位, 再对基础状态分类
          */
-        if (task->exit_state & EXIT_ZOMBIE) {
+        if (p->exit_state & EXIT_ZOMBIE) {
             kstat.zombie_processes++;
-        } else if (task->exit_state & EXIT_DEAD) {
+        } else if (p->exit_state & EXIT_DEAD) {
             /* skip */
         } else {
-            /*
-             * __state 可能带有标志位:
-             *   TASK_WAKEKILL (0x0080)
-             *   TASK_NOLOAD   (0x0400)
-             *   TASK_WAKING   (0x0100)
-             * 必须先用掩码清除标志位, 再对基础状态分类
-             */
-            unsigned int s = task->__state;
+            unsigned int s = p->__state;
 
             if (s & TASK_NOLOAD) {
                 /* TASK_IDLE = UNINTERRUPTIBLE | NOLOAD */
@@ -227,14 +239,25 @@ SYSCALL_DEFINE1(proc_stat, struct proc_stat __user *, stat)
             }
         }
 
-        /* 内核线程 vs 用户线程 */
-        if (task->mm == NULL)
-            kstat.kernel_threads++;
-        else
-            kstat.user_threads++;
+        /*
+         * 遍历该线程组的所有子线程，精确统计内核线程和用户线程。
+         *
+         * for_each_thread(p, t) 遍历以 p 为 leader 的线程组中所有
+         * task_struct，包括 p 自身（主线程）。
+         *
+         * 纠正了早期仅用 for_each_process 的 bug:
+         * for_each_process 只遍历线程组 leader，导致 user_threads
+         * 和 kernel_threads 实际统计的是"进程数"而非线程数。
+         */
+        for_each_thread(p, t) {
+            if (t->mm == NULL)
+                kstat.kernel_threads++;
+            else
+                kstat.user_threads++;
+        }
     }
 
-    read_unlock(&tasklist_lock);
+    rcu_read_unlock();
 
     if (copy_to_user(stat, &kstat, sizeof(kstat)))
         return -EFAULT;
@@ -560,43 +583,44 @@ Total: 80 bytes (0x50)
   - 编译器自动插入 2 个 4 字节 padding (偏移 28, 76)
 ```
 
-### 3.4 lock-drop-copy-relock 锁模式示意图
+### 3.4 kvmalloc + RCU 安全遍历示意图
 
 ```
 时间线
-────────────────────────────────────────────────────►
+──────────────────────────────────────────────────►
 
-  task1 (PID=1)        task2 (PID=10)       task3 (PID=50)
-  ┌──────────┐        ┌──────────┐        ┌──────────┐
-  │init_task │───→────│ task1    │───→────│ task2    │───→ ...
-  └──────────┘        └──────────┘        └──────────┘
+Phase 1: 内核分配 + RCU 遍历
+  kbuf = kvmalloc_array(max_count, sizeof(proc_info))  ← 内核堆分配
+  rcu_read_lock()                        ← 进入 RCU 读临界区
+    for_each_process(task):              ← 一次性遍历所有进程
+      kbuf[0] ← task1 的 proc_info       ┐
+      kbuf[1] ← task2 的 proc_info       │ RCU 保护期间
+      kbuf[2] ← task3 的 proc_info       │ task_struct 不释放
+      ...                                ┘
+  rcu_read_unlock()                      ← 退出 RCU 临界区
 
-第 1 次迭代:
-  read_lock()  ──→  read_lock()
-  task=task1        kinfo ← 从 task1 提取
-                    next = next_task(task1) = task2  ← 持锁保存
-  ──────────────────────────────────────────
-  read_unlock()
-  copy_to_user(&buf[0], &kinfo, 80)  ← 可睡眠 (缺页→磁盘 I/O)
-  ──────────────────────────────────────────
-  read_lock()  ──→  read_lock()
-  task = next = task2  ← 使用保存的指针
+Phase 2: 一次性 copy_to_user
+  copy_to_user(user_buf, kbuf, count * sizeof(proc_info))
+                                         ← 无锁，可安全睡眠
 
-第 2 次迭代:
-                    kinfo ← 从 task2 提取
-                    next = next_task(task2) = task3
-  ──────────────────────────────────────────
-  read_unlock()
-  copy_to_user(&buf[1], &kinfo, 80)
-  ──────────────────────────────────────────
-  read_lock()
+Phase 3: 释放内核缓冲区
+  kvfree(kbuf)
 
-  ... 重复直至遍历完链表 ...
+关键保证:
+  - rcu_read_lock() 期间 task_struct 不会被释放
+    (__put_task_struct → call_rcu → 宽限期后才 kfree)
+  - for_each_process() 是 RCU-safe 宏，无需手动管理 next 指针
+  - 整个遍历在 RCU 保护下一次性完成，无锁间竞争窗口
+  - copy_to_user() 在 RCU 临界区外执行，安全睡眠
 
-关键约束:
-  - RCU 读者不能睡眠: copy_to_user() 在 read_unlock() 之后调用
-  - UAF 防护: next 值持锁时保存, task 被释放不影响后续遍历
-  - task->tasks.next 不可用: task 被 RCU 回收后, 通过 task 解引用是 UAF
+与旧版 lock-drop-copy-relock 的对比:
+  旧: read_lock → 填 kinfo → save next → read_unlock →
+      copy_to_user(1条) → read_lock → task=next → ... (重复 N 次)
+      [UAF 风险: copy_to_user 睡眠期间 next 可能被释放]
+
+  新: kvmalloc → rcu_read_lock → 填全部 kbuf → rcu_read_unlock →
+      copy_to_user(全部) → kvfree
+      [安全: RCU 保证遍历期间所有指针有效]
 ```
 
 ### 3.5 进程状态位掩码表
@@ -727,10 +751,14 @@ Note: mismatches expected due to race between collect & stat syscalls
 ```
 系统调用            典型延迟 (μs)    说明
 ──────────────      ────────────     ──────────────────
-proc_collect (470)  300 - 2000      遍历 381 个进程 + 381 次 copy_to_user
-proc_snapshot (471) 300 - 1500      遍历 381 个进程 + level 计算
-proc_stat (472)     50  - 100       一次遍历, 仅整数运算, 全程持锁
+proc_collect (470)  200 - 1500      RCU 遍历 + kvmalloc 填充 + 一次性 copy_to_user
+proc_snapshot (471) 200 - 1200      RCU 遍历 + level 计算
+proc_stat (472)      50 - 100       for_each_process + for_each_thread, 仅整数运算
 ```
+
+新版相比旧版 (lock-drop-copy-relock) 的延迟降低主要来自：
+- 消除每进程一次的 read_unlock/read_lock 对（2N 次锁操作 → 1 次）
+- 一次性 copy_to_user 替代 N 次逐个拷贝
 
 ---
 

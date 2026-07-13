@@ -65,7 +65,7 @@ Linux 6.18 内核 · 自定义系统调用 (470/471/472)
 │  │  │  sys_proc_snapshot (471)         │  │ │
 │  │  │  sys_proc_stat     (472)         │  │ │
 │  │  └──────────┬───────────────────────┘  │ │
-│  │             │ read_lock(&tasklist_lock) │ │
+│  │             │ rcu_read_lock()           │ │
 │  │             ▼                           │ │
 │  │  ┌──────────────────────────────────┐  │ │
 │  │  │  task_struct 链表 (RCU 保护)      │  │ │
@@ -75,7 +75,7 @@ Linux 6.18 内核 · 自定义系统调用 (470/471/472)
 └─────────────────────────────────────────────┘
 ```
 
-数据流向: 内核遍历 `task_struct` 链表 → 提取字段填入 `proc_info` / `proc_tree_node` → `copy_to_user()` → 用户态 buffer → TUI 渲染。
+数据流向: 内核 `rcu_read_lock()` 保护遍历 `task_struct` 链表 → 提取字段填入 kvmalloc 分配的 `proc_info` / `proc_tree_node` 缓冲区 → `rcu_read_unlock()` → 一次性 `copy_to_user()` → 用户态 buffer → TUI 渲染。
 
 ---
 
@@ -165,12 +165,15 @@ struct proc_stat {
 - `SYSCALL_DEFINEn(name, ...)` — 宏，展开为系统调用入口函数 `sys_name`，自动处理参数从用户态寄存器解码
 
 `<linux/sched.h>`:
-- `for_each_process(task)` — 宏，遍历 `task_struct` 链表
-- `next_task(task)` — 宏，返回链表中 `task` 的下一个节点
-- `read_lock(&tasklist_lock)` / `read_unlock(&tasklist_lock)` — 获取/释放 tasklist_lock 读锁
+- `for_each_process(task)` — 宏，遍历 `task_struct` 链表（RCU-safe）
+- `for_each_thread(leader, t)` — 宏，遍历线程组 leader 下的所有线程（含主线程自身）
 - `get_task_comm(buf, task)` — 安全复制进程名到 buf
 - `task_tgid_nr(task)` — 获取线程组 ID，即用户态视角的 PID
 - `task_nice(task)` — 获取 nice 值 (-20~19)
+- `rcu_dereference(p)` — RCU 保护下的指针读取，添加内存屏障防止编译器优化
+
+`<linux/rcupdate.h>`:
+- `rcu_read_lock()` / `rcu_read_unlock()` — 进入/退出 RCU 读临界区。持有期间所有 task_struct 不会被释放（__put_task_struct 通过 call_rcu 延迟回收至宽限期结束）
 
 `<linux/sched/signal.h>`:
 - `task->signal->nr_threads` — 线程组内线程数
@@ -193,13 +196,17 @@ struct proc_stat {
 - `get_mm_rss(mm)` — 获取常驻内存集页数
 - `PAGE_SHIFT` — 页大小对应的位移量 (12 → 4KB)
 
+`<linux/kvmalloc.h>`:
+- `kvmalloc_array(n, size, flags)` — 分配 n 个元素的内核数组，优先 kmalloc（物理连续），失败则降级 vmalloc（虚拟连续）
+- `kvfree(ptr)` — 释放 kvmalloc 分配的内存（自动识别 kmalloc/vmalloc）
+
 **本项目自实现的函数**:
 
 内核侧 (`kernel/proc_monitor.c`):
-- `sys_proc_collect()` — 系统调用 470。遍历进程链表，采集 11 个字段填入 `proc_info`，逐个 `copy_to_user()` 到用户态数组
-- `sys_proc_snapshot()` — 系统调用 471。遍历进程链表，计算树深度，填入 `proc_tree_node` 并拷贝
-- `sys_proc_stat()` — 系统调用 472。遍历一次，按状态分类计数，填 9 个计数器
-- `compute_level(task)` — 从 `task` 沿 `real_parent` 向上走到 `init_task`，累计步数
+- `sys_proc_collect()` — 系统调用 470。rcu_read_lock + for_each_process 遍历所有进程，填入 kvmalloc 分配的 proc_info 内核缓冲区，释放锁后一次性 copy_to_user
+- `sys_proc_snapshot()` — 系统调用 471。同上模式，遍历并计算树深度，填入 proc_tree_node 缓冲区。compute_level 使用 rcu_dereference 沿 real_parent 上溯
+- `sys_proc_stat()` — 系统调用 472。rcu_read_lock 遍历线程组 leader 做状态分类 + for_each_thread 精确统计所有用户/内核线程数，循环后拷贝
+- `compute_level(task)` — 从 `task` 沿 `real_parent` 向上走到 `init_task`，累计步数。全程使用 `rcu_dereference` 读取父指针
 
 用户态 (`user_app/proc_monitor.c`) — 见 §4。
 
@@ -207,36 +214,42 @@ struct proc_stat {
 
 签名: `long sys_proc_collect(struct proc_info *user_buf, int max_count, int *ret_count)`
 
-遍历进程链表，为每个进程填充一个 `proc_info`。字段采集逻辑:
+实现策略: 内核分配中转缓冲区 + RCU 保护遍历。流程如下:
 
-- `comm`: `get_task_comm()` — 最多 15 字符 + NUL
-- `pid`: `task_tgid_nr(task)` — 线程组 ID
-- `ppid`: `task_tgid_nr(task->real_parent)` — 真实父进程 TGID
-- `state`: `task->__state | task->exit_state` — 合并调度状态和退出状态
-- `utime` / `stime`: `task_cputime()` → 纳秒 → `nsec_to_clock_t()` → USER_HZ 滴答
-- `vsize`: `task->mm->total_vm << PAGE_SHIFT` → 字节。内核线程 (`mm==NULL`) 填 0
-- `rss`: `get_mm_rss(task->mm)` → 页数。内核线程填 0
-- `nice`: `task_nice(task)` — -20 到 19
-- `num_threads`: `task->signal->nr_threads`
-- `uid`: `from_kuid_munged(current_user_ns(), task_uid(task))` — 映射到调用者命名空间
+1. `kvmalloc_array(max_count, sizeof(struct proc_info), GFP_KERNEL)` 分配内核缓冲区 `kbuf`。kvmalloc 优先尝试 kmalloc（物理连续、快速），分配失败则自动降级到 vmalloc（虚拟连续、适合大数组）
+2. `rcu_read_lock()` 进入 RCU 读临界区。在此期间所有 task_struct 不会被释放，因为 `__put_task_struct` 使用 `call_rcu` 延迟回收，需等待宽限期结束
+3. `for_each_process(task)` 遍历所有线程组 leader，为每个进程填充 `kbuf[count]`:
+   - `comm`: `get_task_comm()` — 最多 15 字符 + NUL
+   - `pid`: `task_tgid_nr(task)` — 线程组 ID
+   - `ppid`: `task_tgid_nr(rcu_dereference(task->real_parent))` — 真实父进程 TGID，`rcu_dereference` 确保正确读取可能被 reparent 并发修改的指针
+   - `state`: `task->__state | task->exit_state` — 合并调度状态和退出状态
+   - `utime` / `stime`: `task_cputime()` → 纳秒 → `nsec_to_clock_t()` → USER_HZ 滴答
+   - `vsize`: `task->mm->total_vm << PAGE_SHIFT` → 字节。内核线程 (`mm==NULL`) 填 0
+   - `rss`: `get_mm_rss(task->mm)` → 页数。内核线程填 0
+   - `nice`: `task_nice(task)` — -20 到 19
+   - `num_threads`: `task->signal->nr_threads`（signal 为空时保守取 1）
+   - `uid`: `from_kuid_munged(current_user_ns(), task_uid(task))` — 映射到调用者命名空间
+4. `rcu_read_unlock()` 退出 RCU 临界区
+5. 一次性 `copy_to_user(user_buf, kbuf, count * sizeof(...))` — 此时无锁，可安全睡眠
+6. `kvfree(kbuf)` 释放内核缓冲区
 
-锁模式: lock-drop-copy-relock（§3.5）。
+安全保证: RCU 保护遍历期间 task_struct 不释放 → 无 UAF。一次性 copy_to_user → 消除锁间竞争窗口。
 
-返回值: 0 成功; `-EINVAL` 参数无效; `-EFAULT` copy_to_user 失败（尽力返回已拷贝数量）。
+返回值: 0 成功; `-EINVAL` 参数无效; `-ENOMEM` 内核内存不足; `-EFAULT` copy_to_user 失败。
 
 ### 3.3 sys_proc_snapshot (471)
 
 签名: `long sys_proc_snapshot(struct proc_tree_node *user_buf, int max_count, int *ret_count)`
 
-与 collect 相同的遍历和锁模式。每个节点记录 `pid`, `ppid`, `comm`, `level`。
-`level` 由 `compute_level()` 计算：从 `task->real_parent` 向上追溯到 `init_task`，步数即深度。
-用户态可基于 `pid/ppid` 重建树，也可直接用 `level` 按缩进渲染。
+与 collect 相同的 kvmalloc + RCU 模式。每个节点记录 `pid`, `ppid`, `comm`, `level`。
+`level` 由 `compute_level()` 计算：在 RCU 保护下沿 `rcu_dereference(task->real_parent)` 向上追溯到 `init_task`，步数即深度。用户态可基于 `pid/ppid` 重建树，也可直接用 `level` 按缩进渲染。
 
 ### 3.4 sys_proc_stat (472)
 
 签名: `long sys_proc_stat(struct proc_stat *stat)`
 
-一次遍历完成全部计数。循环内只做整数运算，不调用 `copy_to_user()`，因此全程持锁。
+使用 `rcu_read_lock()` 保护遍历。循环内只做整数运算，唯一 `copy_to_user()` 在循环之后，
+全程不违反 RCU 不睡眠约束。
 
 分类逻辑（当前版本，使用位掩码）:
 
@@ -258,8 +271,12 @@ for_each_process(task):
                 __TASK_STOPPED / __TASK_TRACED → stopped_processes++
                 default              → idle_processes++
 
-    task->mm == NULL → kernel_threads++
-    else             → user_threads++
+    // 遍历线程组内所有线程 (含主线程自身)，精确统计
+    for_each_thread(p, t):
+        t->mm == NULL → kernel_threads++
+        else          → user_threads++
+rcu_read_unlock()
+copy_to_user(stat, &kstat, sizeof(kstat))
 ```
 
 必须先用掩码清除 `TASK_WAKEKILL` 和 `TASK_WAKING`，再 `switch` 基础状态。
@@ -268,40 +285,51 @@ for_each_process(task):
 语义上就是 UNINTERRUPTIBLE|NOLOAD，归 idle。早期版本因未做掩码处理，交叉验证出现
 系统性 MISMATCH（附录 C.4）。
 
+`for_each_thread()` 嵌套在 `for_each_process()` 内：外层遍历线程组 leader 做状态分类，
+内层遍历该线程组下的所有 task_struct（含主线程和非主线程），基于 `t->mm == NULL`
+精确统计内核线程和用户线程的实际数量。这纠正了早期版本仅用 `for_each_process`
+导致 `kernel_threads`/`user_threads` 只统计线程组 leader（即进程数）而非全部线程的 bug。
+
 ### 3.5 锁策略
 
-进程链表 (`task_struct->tasks`) 由 RCU 和 `tasklist_lock` 保护。
+进程链表由 RCU 保护。核心约束: RCU 读临界区内不能睡眠，而 `copy_to_user()` 可能因
+缺页触发磁盘 I/O 而睡眠。
 
-约束: RCU 读临界区内不能睡眠。若读者被调度，写者必须等该 CPU 经历 RCU 宽限期，
-导致长时间阻塞。而 `copy_to_user()` 可能因缺页触发磁盘 I/O 而睡眠。
-
-collect 和 snapshot 采用 lock-drop-copy-relock:
+**解法: 内核中转缓冲区 + RCU 一次遍历**:
 
 ```
-read_lock(&tasklist_lock);
-task = next_task(&init_task);
+kvmalloc_array(max_count, sizeof(proc_info), GFP_KERNEL)  → kbuf
 
-while (task != &init_task) {
-    从 task 读取字段填入 kinfo/knode
-    next = next_task(task);        // 持锁保存后继指针
-    read_unlock(&tasklist_lock);
-
-    copy_to_user(&buf[i], &kinfo, sizeof(kinfo));  // 无锁，可能睡眠
+rcu_read_lock();
+for_each_process(task) {
+    从 task 依次提取字段，填入 kbuf[count];
     count++;
-
-    read_lock(&tasklist_lock);
-    task = next;
 }
+rcu_read_unlock();
 
-read_unlock(&tasklist_lock);
+copy_to_user(user_buf, kbuf, count * sizeof(proc_info));  // 一次性拷贝，无锁
+kvfree(kbuf);
 ```
 
-保存 `next_task(task)` 而非通过 `task->tasks.next` 获取后继：释放锁后 `task`
-可能因进程退出被 RCU 回收，`task->tasks.next` 是 UAF。提前保存的 `next` 是独立
-指针值，只要目标进程未退出就一直有效。
+这是标准现代做法，相较早期采用的 lock-drop-copy-relock 模式有两个关键改进:
 
-stat 例外: `sys_proc_stat` 循环中只做整数运算，唯一 `copy_to_user()` 在循环之后，
-因此可以全程持锁。
+1. **UAF 彻底消除**: RCU 读临界区内，所有 task_struct 不会被释放（`__put_task_struct`
+通过 `call_rcu` 延迟回收，需等待当前 CPU 经历一次宽限期才能执行真正的 `kfree`）。
+因此 `for_each_process` 遍历到的每一个 task_struct 都保证有效，不存在"保存的 next
+指针因目标进程退出而悬空"的风险。
+
+2. **性能提升**: 早期模式每遍历一个进程需要 read_unlock + read_lock 各一次（共 2N 次
+锁操作），且每个条目单独 copy_to_user。新模式仅一次 RCU 锁 + 一次大块 copy_to_user，
+减少了锁争用和上下文切换。
+
+`sys_proc_stat` 同样使用 `rcu_read_lock` 保护遍历：循环内只做整数运算，唯一
+`copy_to_user()` 在循环之后，不违反 RCU 约束。
+
+**为什么弃用 tasklist_lock**: 早期版本使用 `read_lock(&tasklist_lock)` + lock-drop-copy-relock。
+问题在于 lock 和 unlock 之间的时间窗口——`copy_to_user` 睡眠期间，如果保存的 `next`
+指向的进程退出并经历 RCU 宽限期完成回收，重新加锁后 `task = next` 访问的已是悬空指针。
+`tasklist_lock` 本身不阻止 task_struct 被释放（释放由 RCU 控制），只序列化链表修改。
+而 RCU 读锁直接保证了 "持有期间不释放" 这一关键语义。
 
 ### 3.6 进程状态编码
 
@@ -462,15 +490,23 @@ x86_64 上，用户态执行 `syscall` 指令触发 CPU 模式切换。硬件完
 第 3 步可能因 swap 换页、Copy-on-Write、mmap 文件映射等触发缺页 → 磁盘 I/O → 睡眠。
 因此 `copy_to_user()` 绝对不能在持有自旋锁或 RCU 读锁时调用。
 
-### 5.3 RCU 与 tasklist_lock
+### 5.3 RCU 与 task_struct 生命周期
 
-进程链表是 read-mostly 结构。RCU 优化读者（零同步开销），写者延迟回收旧版本。
+进程链表是 read-mostly 结构。`task_struct` 的释放采用 RCU 延迟回收:
+`__put_task_struct()` → `call_rcu(&p->rcu, delayed_put_task_struct)` →
+宽限期结束后 → `kfree(p)`。因此 `rcu_read_lock()` 持有期间遍历到的所有
+task_struct 都不会被释放。
 
-`read_lock(&tasklist_lock)` 等价 `preempt_disable()` + 读者计数 +1。读者睡眠导致
-写者阻塞直至宽限期结束——因此 `copy_to_user()` 必须在锁外。
+本项目使用 `rcu_read_lock() + for_each_process()` 遍历，而非早期版本的
+`read_lock(&tasklist_lock)`。关键原因: `tasklist_lock` 序列化对链表的修改
+（fork 添加、exit 删除），但不阻止 task_struct 被释放（释放由 RCU 控制）。
+而 `rcu_read_lock()` 直接保证了"持有期间不释放"这一关键语义，从根本上消除了
+lock-drop-copy-relock 模式中的 UAF 风险。
 
-collect/snapshot: lock-drop-copy-relock。stat: 全程持锁（循环内无 `copy_to_user()`）。
-381 进程正常耗时: collect ~300-2000μs, stat ~50-100μs。
+每个系统调用的锁策略: collect 和 snapshot 在 RCU 保护下将所有数据填入
+kvmalloc 缓冲区，释放锁后一次性 copy_to_user。stat 在 RCU 保护下完成
+所有计数，释放锁后拷贝结果。381 进程正常耗时: collect ~300-2000μs,
+stat ~50-100μs。
 
 ### 5.4 指针安全与内核栈限制
 
@@ -479,7 +515,8 @@ collect/snapshot: lock-drop-copy-relock。stat: 全程持锁（循环内无 `cop
 
 内核栈大小: `THREAD_SIZE = 16KB`，扣除 `pt_regs` 和中断帧实际可用约 12KB。
 `struct proc_info[8192]` = 640KB 远超限制，会导致栈溢出 → 内核 panic。
-逐个 `copy_to_user()` 避免了在内核栈上分配大数组。
+因此使用 `kvmalloc_array()` 在内核堆上分配中转缓冲区（自动降级到 vmalloc
+处理大分配），而非在内核栈上分配。
 
 ---
 
@@ -601,6 +638,18 @@ ncurses 区分大小写。修复: 添加 `case 'V':`。教训: ncurses 中字母
 提交 `623dfcc`。症状: 第一帧后 CPU% 异常巨大（数百到数千百分比）。根因: 时间戳
 在 `save_prev_cpu()`（渲染前）记录，`elapsed ≈ 0`。修复: 时间戳记录移至
 `update_data()` 中。教训: CPU% 的时间差必须基于数据采集点，而非渲染点。
+
+### C.6 UAF 危险: lock-drop-copy-relock → RCU + kvmalloc
+
+提交 `9c47a9c`。隐患: lock-drop-copy-relock 模式中，`next = next_task(task)` 在持锁时
+保存后继指针，释放锁后 `copy_to_user` 可能因缺页睡眠。若 `next` 指向的进程在睡眠期间
+退出并完成 RCU 宽限期，重新加锁后 `task = next` 访问的 task_struct 已被释放——悬空指针
+解引用，内核崩溃。根因: `tasklist_lock` 只序列化链表修改，不阻止 task_struct 被释放
+（释放由 RCU 控制）。修复: 全面改用 `rcu_read_lock()` + `kvmalloc_array` 内核中转缓冲区。
+RCU 读临界区保证遍历期间所有 task_struct 不会被释放（`__put_task_struct` 使用
+`call_rcu` 延迟回收），从根本上消除 UAF 风险。同时将逐个 `copy_to_user` 改为一次性
+大块拷贝，减少锁争用。教训: `tasklist_lock` 和 RCU 是不同层次的保护机制，前者保证
+链表结构完整性，后者保证节点生命周期。遍历需读节点内容时，只有 RCU 才能保证指针有效。
 
 ---
 
