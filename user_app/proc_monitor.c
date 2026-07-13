@@ -1298,7 +1298,7 @@ static void render_hint_panel(void)
 		mvwprintw(win_hint, 0, 0,
 			  " v:view[%s] n/p:prev/next-proc "
 			  "%s%s:scroll Tab:sort s:rev "
-			  "/:filter r:clear x:export h:help q:quit",
+			  "/:filter r:clear x:export-all h:help q:quit",
 			  g_view_names[g_view_mode],
 			  "\xe2\x86\x91\xe2\x86\x93",  /* ↑↓ (UTF-8 arrows) */
 			  "");
@@ -1307,7 +1307,7 @@ static void render_hint_panel(void)
 		wattron(win_hint, COLOR_PAIR(5));
 		mvwprintw(win_hint, 0, 0,
 			  " v:view[%s] %s%s:sel Tab:sort s:rev "
-			  "/:filter r:clear x:export h:help q:quit",
+			  "/:filter r:clear x:export-all h:help q:quit",
 			  g_view_names[g_view_mode],
 			  "\xe2\x86\x91\xe2\x86\x93",  /* ↑↓ (UTF-8 arrows) */
 			  "");
@@ -1481,9 +1481,10 @@ static void show_help(void)
 	printf("  :1234           Exact PID\n");
 	printf("\n");
 	printf("EXPORT (x key):\n");
-	printf("  LIST/DEBUG      -> CSV file\n");
-	printf("  TREE            -> DOT (Graphviz) file\n");
-	printf("  HEX/SYSCALL     -> Raw binary dump (.bin)\n");
+	printf("  Exports all three formats at once:\n");
+	printf("    <name>.csv  — process list\n");
+	printf("    <name>.dot  — process tree (Graphviz)\n");
+	printf("    <name>.bin  — raw binary dump\n");
 	printf("\n");
 	printf("OTHER:\n");
 	printf("  h / ?           Show this help\n");
@@ -1506,26 +1507,12 @@ static void show_help(void)
 
 static void do_export(void)
 {
-	char fname[256];
+	char base[256] = "proc_monitor";
 
 	def_prog_mode();
 	endwin();
 
-	switch (g_view_mode) {
-	case 0: /* LIST -> CSV */
-	case 1: /* DEBUG -> CSV */
-		snprintf(fname, sizeof(fname), "proc_list.csv");
-		printf("Export CSV to [%s]: ", fname);
-		break;
-	case 2: /* TREE -> DOT */
-		snprintf(fname, sizeof(fname), "proc_tree.dot");
-		printf("Export DOT to [%s]: ", fname);
-		break;
-	default: /* HEX/SYSCALL -> RAW */
-		snprintf(fname, sizeof(fname), "proc_dump.bin");
-		printf("Export RAW to [%s]: ", fname);
-		break;
-	}
+	printf("Export all formats (CSV + DOT + BIN) to [%s]: ", base);
 	fflush(stdout);
 
 	{
@@ -1533,7 +1520,7 @@ static void do_export(void)
 		if (fgets(buf, sizeof(buf), stdin) && buf[0] != '\n') {
 			size_t l = strlen(buf);
 			if (l > 0 && buf[l-1] == '\n') buf[l-1] = '\0';
-			snprintf(fname, sizeof(fname), "%s", buf);
+			snprintf(base, sizeof(base), "%s", buf);
 		}
 	}
 
@@ -1543,17 +1530,17 @@ static void do_export(void)
 	/* 确保拿到最新数据 */
 	update_data();
 
-	switch (g_view_mode) {
-	case 0:
-	case 1:
+	{
+		char fname[280];
+		snprintf(fname, sizeof(fname), "%s.csv", base);
 		export_csv(fname);
-		break;
-	case 2:
+		snprintf(fname, sizeof(fname), "%s.dot", base);
 		export_tree_dot(fname);
-		break;
-	default:
+		snprintf(fname, sizeof(fname), "%s.bin", base);
 		export_raw(fname);
-		break;
+		snprintf(g_last_msg, sizeof(g_last_msg),
+			 "exported: %s.csv + %s.dot + %s.bin (%d procs, %d nodes)",
+			 base, base, base, g_proc_count, g_tree_count);
 	}
 }
 
